@@ -196,7 +196,11 @@ app.use((err, req, res, next) => {
   });
 });
 
-bootstrap().catch((err) => {
-  console.error('[Backend] ❌ Failed to start server:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  bootstrap().catch((err) => {
+    console.error('[Backend] ❌ Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = app;
