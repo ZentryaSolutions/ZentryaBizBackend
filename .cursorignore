@@ -1,0 +1,399 @@
+# ============================================
+# STRICT COST OPTIMIZATION - .cursorignore
+# Goal: Reduce token usage from MILLIONS to THOUSANDS
+# ============================================
+# IMPORTANT: Always allow critical project files (exceptions at top)
+# ============================================
+# Critical files that MUST be editable (never block these)
+!package.json
+!package-lock.json
+!main.js
+!preload.js
+!database/setup.js
+!database/complete_schema.sql
+!build/installer.nsh
+!build/*.nsh
+!scripts/*.js
+!backend/server.js
+!backend/db.js
+!backend/.env.example
+!frontend/src/locales/en.json
+!frontend/src/locales/ur.json
+!frontend/src/locales/*.json
+node_modules/
+.git/
+dist/
+build/
+# ============================================
+
+# ============================================
+# CRITICAL: Node.js Dependencies (BIGGEST TOKEN CONSUMER)
+# ============================================
+node_modules/
+**/node_modules/
+package-lock.json
+**/package-lock.json
+yarn.lock
+**/yarn.lock
+pnpm-lock.yaml
+**/pnpm-lock.yaml
+# Impact: Excludes 100k+ files, saves 50-90% of tokens
+
+# ============================================
+# CRITICAL: Build & Distribution Output
+# ============================================
+# IMPORTANT: NSIS installer scripts MUST be editable (exceptions before exclusion)
+!build/installer.nsh
+!build/*.nsh
+build/
+**/build/
+dist/
+**/dist/
+out/
+**/out/
+.next/
+**/.next/
+.vite/
+**/.vite/
+win-unpacked/
+**/win-unpacked/
+*.exe
+*.blockmap
+*.dmg
+*.pkg
+*.deb
+*.rpm
+latest.yml
+builder-*.yml
+builder-*.yaml
+*.asar
+*.asar.unpacked
+# Impact: Compiled files duplicate source, Electron installers are MBs each
+
+# ============================================
+# CRITICAL: Documentation Files (40+ files found)
+# ============================================
+*.md
+**/*.md
+docs/
+**/docs/
+# Allow only root README.md
+!README.md
+# Impact: 40+ markdown files consuming thousands of tokens per prompt
+
+# ============================================
+# CRITICAL: Database Backups & Logs
+# ============================================
+backup/
+**/backup/
+backend/backup/
+**/backend/backup/
+# Exclude ALL backup SQL files (they're 400KB+ each)
+backup/*.sql
+**/backup/*.sql
+backend/backup/*.sql
+**/backend/backup/*.sql
+# Exclude ALL SQL files by default (large), but KEEP database schema/migrations
+*.sql
+!database/*.sql
+!database/**/*.sql
+*.log
+*.db
+*.sqlite
+*.sqlite3
+# Impact: SQL backups can be 10-100MB each
+
+# ============================================
+# CRITICAL: Source Maps & Compiled Assets
+# ============================================
+*.map
+*.LICENSE.txt
+# CRITICAL: Exclude ALL CSS files (they're large and rarely need AI editing)
+*.css
+**/*.css
+**/static/css/*.css
+**/static/**/*.css
+# But allow component CSS files (small, needed for styling)
+!frontend/src/components/*.css
+!frontend/src/**/*.css
+# Exclude compiled JS files
+**/static/js/*.js
+**/static/**/*.js
+*.min.js
+*.min.css
+*.bundle.js
+*.chunk.js
+# TypeScript compiled libs (10MB+ each)
+**/typescript/lib/*.js
+**/typescript/lib/*.d.ts
+**/tsc.js
+**/tsserver.js
+**/typescriptServices.js
+# Impact: Source maps duplicate source, compiled assets are minified copies, TS libs are huge
+
+# ============================================
+# CRITICAL: Test Files & Test Data
+# ============================================
+test-*.js
+test-*.html
+test-*.ts
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+__tests__/
+**/__tests__/
+__mocks__/
+**/__mocks__/
+coverage/
+**/coverage/
+.nyc_output/
+**/.nyc_output/
+# Impact: Test files are large and rarely edited
+
+# ============================================
+# CRITICAL: Git & Version Control
+# ============================================
+.git/
+**/.git/
+.gitignore
+.gitattributes
+.gitmodules
+# Impact: Git metadata not needed for code editing
+
+# ============================================
+# CRITICAL: Environment & Config Files
+# ============================================
+.env
+.env.*
+**/.env
+**/.env.*
+credentials.json
+**/credentials.json
+config.json
+**/config.json
+secrets.json
+**/secrets.json
+# Impact: Config files may contain secrets, rarely edited
+
+# ============================================
+# CRITICAL: OS & Editor Files
+# ============================================
+.DS_Store
+**/.DS_Store
+Thumbs.db
+**/Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+**/.vscode/
+.idea/
+**/.idea/
+*.sublime-*
+*.code-workspace
+# Impact: OS and editor metadata files
+
+# ============================================
+# CRITICAL: Binary Assets (Images, Videos, PDFs)
+# ============================================
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.webp
+*.bmp
+*.tiff
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+*.dll
+*.so
+*.dylib
+*.exe
+*.bin
+# Impact: Binary files are large and not needed for code editing
+
+# ============================================
+# CRITICAL: Temporary & Cache Files
+# ============================================
+*.tmp
+*.temp
+*.cache
+**/.cache/
+.cache/
+**/.tmp/
+.tmp/
+*.pid
+*.seed
+*.pid.lock
+.npm/
+**/.npm/
+.eslintcache
+**/.eslintcache
+.stylelintcache
+**/.stylelintcache
+# Webpack & Build Caches
+**/webpack/cache/
+**/webpack/lib/cache/
+**/persistentCache/
+**/.vite/
+**/.next/
+**/coverage/
+**/.nyc_output/
+# Frontend build caches (57MB+ files)
+frontend/node_modules/.cache/
+**/node_modules/.cache/
+**/default-development/
+**/*.pack
+# Impact: Cache files are auto-generated, can be 100MB+
+
+# ============================================
+# CRITICAL: Legacy & Unused Files
+# ============================================
+clear
+git
+restart.bat
+restart-app.ps1
+RESTART_INSTRUCTIONS.txt
+# Impact: Temporary/legacy files not needed
+
+# ============================================
+# CRITICAL: Database Migration Scripts (if not actively editing)
+# ============================================
+# Note: SQL files in database/ are kept for schema reference
+# But exclude large migration backups
+database/migration_*.sql
+database/*.md
+database/run-*.js
+# Impact: Migration files are large and rarely edited
+
+# ============================================
+# CRITICAL: Scripts & Utilities (if not actively editing)
+# ============================================
+# IMPORTANT: scripts/*.js is allowed (see top of file)
+scripts/
+**/scripts/
+# Impact: Scripts are rarely edited, exclude unless needed
+
+# ============================================
+# CRITICAL: Electron Main Files (if not actively editing)
+# ============================================
+# IMPORTANT: main.js and preload.js are allowed (see top of file)
+electron-builder.yml
+# Impact: Electron config rarely changes, but main files are essential
+
+# ============================================
+# CRITICAL: Public Assets (if not actively editing)
+# ============================================
+public/
+**/public/
+# But allow public/index.html if needed for reference
+!public/index.html
+# Impact: Public assets are static, rarely edited
+
+# ============================================
+# CRITICAL: Assets Folder
+# ============================================
+# Allow assets/postgres/ for PostgreSQL installer bundling
+!assets/postgres/
+!assets/postgres/**/*
+assets/
+**/assets/
+# Impact: Asset files are static
+
+# ============================================
+# CRITICAL: Package JSON & Lock Files
+# ============================================
+# Exclude ALL package-lock.json files (they're 100-700KB each)
+**/package-lock.json
+package-lock.json
+frontend/package-lock.json
+backend/package-lock.json
+# Keep only root package.json files for dependency reference (small files)
+# But exclude nested ones in node_modules (already excluded)
+# Note: package.json files are small, but package-lock.json files are HUGE
+
+# ============================================
+# CRITICAL: Locale & Translation Data in node_modules
+# ============================================
+# These are already excluded via node_modules/, but being explicit:
+**/node_modules/**/locale/
+**/node_modules/**/locales/
+**/node_modules/**/lang/
+**/node_modules/**/i18n/
+**/node_modules/date-fns/**/locale/
+# Impact: date-fns alone has 100+ locale files, each consuming tokens
+
+# ============================================
+# CRITICAL: Large Binary Executables & Certificates
+# ============================================
+# Electron and build tools (already excluded via node_modules, but explicit)
+**/electron/dist/
+**/app-builder-bin/
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+
+# Certificates (.pfx) - keep out of AI context
+*.pfx
+**/*.pfx
+# But allow NSIS installer scripts (*.nsh)
+!*.nsh
+!**/*.nsh
+# Impact: Electron.exe is 172MB, app-builder binaries are 10-20MB each
+
+# ============================================
+# CRITICAL: Generated Documentation
+# ============================================
+**/CHANGELOG.md
+**/CHANGES.md
+**/HISTORY.md
+**/LICENSE
+**/LICENSE.txt
+**/LICENSE.md
+**/AUTHORS
+**/CONTRIBUTORS
+# Impact: License files and changelogs are large and rarely needed
+
+# ============================================
+# CRITICAL: Test Fixtures & Examples
+# ============================================
+**/test/fixtures/
+**/tests/fixtures/
+**/__tests__/fixtures/
+**/examples/
+**/example/
+**/samples/
+**/sample/
+# Impact: Test fixtures and examples are large and not needed for editing
+
+# ============================================
+# CRITICAL: Additional Token Optimization
+# ============================================
+# CRITICAL: Exclude locale/translation JSON files (50KB+ each, consume 50k+ tokens per search!)
+# Exclude all locale JSON files by default
+**/locales/*.json
+# IMPORTANT: Allow frontend locale files (needed for translation fixes) - MUST be editable
+!frontend/src/locales/en.json
+!frontend/src/locales/ur.json
+!frontend/src/locales/*.json
+
+# Exclude JSON backup files
+*.json.bak
+*.json.backup
+**/*.json.bak
+**/*.json.backup
+
+# Impact: Locale files are 50KB+ each, consuming 50k+ tokens per semantic search
+# Package-lock files are 680KB+ each, consuming 680k+ tokens per read
+# Backup SQL files are 400KB+ each, consuming 400k+ tokens per read
