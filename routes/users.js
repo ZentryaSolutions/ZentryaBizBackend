@@ -595,13 +595,17 @@ router.post('/invitations', async (req, res) => {
       <div style="margin:0;padding:18px;background:#eef2ff;font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a">
         <div style="max-width:620px;margin:0 auto;background:linear-gradient(145deg,#ffffff,#f8faff);border:1px solid #dde5ff;border-radius:16px;overflow:hidden;box-shadow:0 10px 28px rgba(30,41,59,.12)">
           <div style="padding:16px 18px;background:linear-gradient(90deg,#4f46e5,#6366f1);color:#fff">
-            <div style="display:flex;align-items:center;gap:10px">
-              <img src="cid:${logoCid}" alt="Zentrya Biz" width="44" height="44" style="border-radius:10px;border:1px solid rgba(255,255,255,.45);object-fit:cover;background:#fff" />
-              <div>
-                <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.9">Zentrya Biz</div>
-                <div style="font-size:20px;font-weight:800;line-height:1.2">Store Team Invitation</div>
-              </div>
-            </div>
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse">
+              <tr>
+                <td width="56" valign="middle" style="width:56px;vertical-align:middle;padding-right:10px">
+                  <img src="cid:${logoCid}" alt="Zentrya Biz" width="44" height="44" style="display:block;width:44px;height:44px;border-radius:10px;border:1px solid rgba(255,255,255,.45);background:#fff" />
+                </td>
+                <td valign="middle" style="vertical-align:middle">
+                  <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.9;line-height:1.3">Zentrya Biz</div>
+                  <div style="font-size:20px;font-weight:800;line-height:1.25;margin-top:2px">Store Team Invitation</div>
+                </td>
+              </tr>
+            </table>
           </div>
           <div style="padding:18px">
             <p style="margin:0 0 10px;font-size:15px;color:#334155">You have been invited as <strong>${roleLabel}</strong> for <strong>${storeName}</strong>.</p>
@@ -753,6 +757,19 @@ router.put('/:id', async (req, res) => {
           `SELECT COUNT(*)::int AS c FROM public.shop_users WHERE user_id = $1::uuid`,
           [zbProfileId]
         );
+        try {
+          await db.query(
+            `UPDATE users
+             SET shop_id = CASE WHEN shop_id = $1::uuid THEN NULL ELSE shop_id END,
+                 updated_at = NOW()
+             WHERE user_id = $2`,
+            [req.shopId, userId]
+          );
+        } catch (shopColErr) {
+          if (!(shopColErr.code === '42703' && String(shopColErr.message || '').includes('shop_id'))) {
+            throw shopColErr;
+          }
+        }
         const hasOtherShops = Number(remaining.rows[0]?.c || 0) > 0;
         result = await db.query(
           `UPDATE users
@@ -831,7 +848,7 @@ router.delete('/:id', async (req, res) => {
 
     // Get user info
     const userResult = await db.query(
-      'SELECT user_id, username, role FROM users WHERE user_id = $1',
+      'SELECT user_id, username, role, zb_profile_id FROM users WHERE user_id = $1',
       [userId]
     );
 
@@ -855,35 +872,60 @@ router.delete('/:id', async (req, res) => {
       }
     }
 
-    const zbProfileRes = await db.query(
-      `SELECT zb_profile_id, username FROM users WHERE user_id = $1 LIMIT 1`,
-      [userId]
-    );
-    const zbProfileId = zbProfileRes.rows[0]?.zb_profile_id;
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
 
-    if (zbProfileId) {
-      await db.query(
-        `DELETE FROM public.shop_users WHERE shop_id = $1::uuid AND user_id = $2::uuid`,
-        [req.shopId, zbProfileId]
-      );
-
-      const remaining = await db.query(
-        `SELECT COUNT(*)::int AS c FROM public.shop_users WHERE user_id = $1::uuid`,
-        [zbProfileId]
-      );
-      const hasOtherShops = Number(remaining.rows[0]?.c || 0) > 0;
-      if (!hasOtherShops) {
-        await db.query(
-          `UPDATE users SET is_active = false, updated_at = NOW() WHERE user_id = $1`,
-          [userId]
+      if (user.zb_profile_id) {
+        // Remove access only for current shop.
+        await client.query(
+          `DELETE FROM public.shop_users WHERE shop_id = $1::uuid AND user_id = $2::uuid`,
+          [req.shopId, user.zb_profile_id]
         );
       }
-    } else {
-      // Legacy fallback: no profile link, keep old deactivation behavior
-      await db.query(
-        `UPDATE users SET is_active = false, updated_at = NOW() WHERE user_id = $1`,
-        [userId]
+
+      // Ensure the user no longer appears in this shop's legacy mapping.
+      try {
+        await client.query(
+          `UPDATE users
+           SET shop_id = CASE WHEN shop_id = $1::uuid THEN NULL ELSE shop_id END,
+               updated_at = NOW()
+           WHERE user_id = $2`,
+          [req.shopId, userId]
+        );
+      } catch (shopColErr) {
+        if (!(shopColErr.code === '42703' && String(shopColErr.message || '').includes('shop_id'))) {
+          throw shopColErr;
+        }
+      }
+
+      // If user has no other shops left, deactivate account globally.
+      let hasOtherShops = false;
+      if (user.zb_profile_id) {
+        const remaining = await client.query(
+          `SELECT COUNT(*)::int AS c FROM public.shop_users WHERE user_id = $1::uuid`,
+          [user.zb_profile_id]
+        );
+        hasOtherShops = Number(remaining.rows[0]?.c || 0) > 0;
+      }
+      await client.query(
+        `UPDATE users
+         SET is_active = $1,
+             updated_at = NOW()
+         WHERE user_id = $2`,
+        [hasOtherShops ? true : false, userId]
       );
+
+      await client.query('COMMIT');
+    } catch (txErr) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_) {
+        /* ignore */
+      }
+      throw txErr;
+    } finally {
+      client.release();
     }
 
     await logAuditEvent({
