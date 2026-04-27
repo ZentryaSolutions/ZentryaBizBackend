@@ -19,14 +19,20 @@ function sslOption() {
 }
 
 function buildPoolConfig() {
+  const poolMax = Number(process.env.DB_POOL_MAX) || 5;
+  const idleTimeoutMillis = Number(process.env.DB_IDLE_TIMEOUT_MS) || 10000;
+  const connectionTimeoutMillis = Number(process.env.DB_CONNECTION_TIMEOUT_MS) || 10000;
   const conn = process.env.DATABASE_URL && process.env.DATABASE_URL.trim();
   if (conn) {
     return {
       connectionString: conn,
       ssl: conn.includes('supabase') ? { rejectUnauthorized: false } : sslOption(),
-      max: Number(process.env.DB_POOL_MAX) || 20,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 15000,
+      // Keep this low for pooled/serverless environments (Supabase session/transaction pooler).
+      max: poolMax,
+      idleTimeoutMillis,
+      connectionTimeoutMillis,
+      keepAlive: true,
+      allowExitOnIdle: true,
     };
   }
 
@@ -42,9 +48,11 @@ function buildPoolConfig() {
     user: process.env.DB_USER || 'postgres',
     password,
     ssl: sslOption(),
-    max: Number(process.env.DB_POOL_MAX) || 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 15000,
+    max: poolMax,
+    idleTimeoutMillis,
+    connectionTimeoutMillis,
+    keepAlive: true,
+    allowExitOnIdle: true,
   };
 }
 
@@ -58,6 +66,29 @@ if (pool) {
 }
 
 const isDatabaseConfigured = () => !!pool;
+
+function isRetriableDbError(error) {
+  const code = error?.code || '';
+  const msg = String(error?.message || '').toLowerCase();
+  return (
+    [
+      '53300', // too_many_connections
+      '57p03', // cannot_connect_now
+      '08000',
+      '08001',
+      '08003',
+      '08004',
+      '08006',
+      '08007',
+      '08p01',
+      'etimedout',
+      'econnreset',
+      'econnrefused',
+    ].includes(String(code).toLowerCase()) ||
+    msg.includes('max clients reached') ||
+    msg.includes('emaxconnsession')
+  );
+}
 
 const query = async (text, params, retries = 3) => {
   if (!pool) {
@@ -78,11 +109,14 @@ const query = async (text, params, retries = 3) => {
       }
       return res;
     } catch (error) {
-      if (attempt === retries) {
+      const retriable = isRetriableDbError(error);
+      if (attempt === retries || !retriable) {
         console.error('Database query error (final):', error.message);
         throw error;
       }
-      await new Promise((r) => setTimeout(r, 1000 * attempt));
+      const backoff = Math.min(4000, 750 * attempt);
+      console.warn(`⚠️ Retrying DB query (${attempt}/${retries}) due to transient error:`, error.message);
+      await new Promise((r) => setTimeout(r, backoff));
     }
   }
 };

@@ -56,6 +56,7 @@ const db = require('./db');
 
 // Flag set after DB test completes (must not read before bootstrap finishes — avoids race with app.listen)
 let dbReady = false;
+let runtimeInitPromise = null;
 
 /**
  * Test DB, run migrations, then listen. Previously app.listen ran before testConnection finished,
@@ -115,6 +116,37 @@ async function bootstrap() {
     }
     process.exit(1);
   });
+}
+
+async function initializeRuntimeOnce() {
+  if (!runtimeInitPromise) {
+    runtimeInitPromise = (async () => {
+      console.log('[Backend] Testing database connection...');
+      dbReady = await db.testConnection(5, 2000);
+
+      if (dbReady) {
+        if (process.env.ENABLE_MIGRATIONS !== 'false') {
+          try {
+            const migrationService = require('./utils/migrationService');
+            const result = await migrationService.runMigrations();
+            if (result.success) {
+              console.log(`[Migration] ✅ Applied: ${result.applied?.length || 0}`);
+            } else {
+              console.error('[Migration] ❌', result.error);
+            }
+          } catch (err) {
+            console.error('[Migration]', err);
+          }
+        }
+      } else {
+        console.error('⚠️ Database unavailable — check DATABASE_URL in runtime env.');
+      }
+    })().catch((err) => {
+      console.error('[Backend] Runtime init failed:', err);
+      throw err;
+    });
+  }
+  return runtimeInitPromise;
 }
 
 // Health check endpoint
@@ -196,7 +228,16 @@ app.use((err, req, res, next) => {
   });
 });
 
-bootstrap().catch((err) => {
-  console.error('[Backend] ❌ Failed to start server:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  bootstrap().catch((err) => {
+    console.error('[Backend] ❌ Failed to start server:', err);
+    process.exit(1);
+  });
+} else {
+  // Serverless runtime (Vercel): do NOT call app.listen()
+  initializeRuntimeOnce().catch((err) => {
+    console.error('[Backend] ❌ Serverless init failed:', err);
+  });
+}
+
+module.exports = app;
