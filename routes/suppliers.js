@@ -4,6 +4,14 @@ const db = require('../db');
 const { requireAuth, requireAdministratorOrProfileOwner } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
 
+/** Trim / lowercase; empty → null. Caller may validate format. */
+function normalizeSupplierEmail(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  return s.toLowerCase();
+}
+
 // Suppliers: legacy administrator role OR Zentrya profile owner/admin (matches frontend isAdmin)
 router.use(requireAuth);
 router.use(requireShopContext);
@@ -25,6 +33,7 @@ function mapSupplierRowForApi(row) {
     supplier_id: row.supplier_id,
     name: row.name ?? '',
     contact_number: row.contact_number != null ? row.contact_number : row.phone ?? null,
+    email: row.email != null && String(row.email).trim() !== '' ? String(row.email).trim() : null,
     address: row.address ?? null,
     notes: row.notes ?? null,
     opening_balance: opening,
@@ -45,8 +54,9 @@ async function querySuppliersList(shopId) {
         supplier_id,
         name,
         contact_number,
-        NULL as address,
-        NULL::text as notes,
+        email,
+        address,
+        notes,
         opening_balance,
         COALESCE((
           SELECT SUM(total_amount) 
@@ -95,8 +105,9 @@ async function querySuppliersList(shopId) {
         supplier_id,
         name,
         contact_number,
-        NULL::text as address,
-        NULL::text as notes,
+        email,
+        address,
+        notes,
         COALESCE(opening_balance, 0)::numeric as opening_balance,
         0::numeric as total_credit_purchases,
         0::numeric as total_paid,
@@ -150,8 +161,9 @@ async function querySupplierById(supplierId, shopId) {
         supplier_id,
         name,
         contact_number,
-        NULL as address,
-        NULL::text as notes,
+        email,
+        address,
+        notes,
         opening_balance,
         COALESCE((
           SELECT SUM(total_amount) 
@@ -189,8 +201,9 @@ async function querySupplierById(supplierId, shopId) {
         supplier_id,
         name,
         contact_number,
-        NULL::text as address,
-        NULL::text as notes,
+        email,
+        address,
+        notes,
         COALESCE(opening_balance, 0)::numeric as opening_balance,
         0::numeric as total_credit_purchases,
         0::numeric as total_paid,
@@ -241,8 +254,15 @@ router.get('/:id', async (req, res) => {
 // Create new supplier
 router.post('/', async (req, res) => {
   try {
-    const { name, contact_number, address, opening_balance, notes } = req.body;
+    const { name, contact_number, email, address, opening_balance, notes } = req.body;
     const notesVal = notes != null && String(notes).trim() !== '' ? String(notes).trim() : null;
+    const emailNorm = normalizeSupplierEmail(email);
+    if (!emailNorm) {
+      return res.status(400).json({ error: 'Supplier email is required' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ error: 'Invalid email address' });
+    }
 
     // Validation
     if (!name || !name.trim()) {
@@ -261,12 +281,13 @@ router.post('/', async (req, res) => {
     let result;
     try {
       result = await db.query(
-        `INSERT INTO suppliers (name, contact_number, address, opening_balance, status, shop_id, notes)
-         VALUES ($1, $2, $3, $4, 'active', $5, $6)
+        `INSERT INTO suppliers (name, contact_number, email, address, opening_balance, status, shop_id, notes)
+         VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
          RETURNING 
            supplier_id,
            name,
            contact_number,
+           email,
            address,
            opening_balance,
            0 as total_credit_purchases,
@@ -275,13 +296,13 @@ router.post('/', async (req, res) => {
            status,
            created_at,
            notes`,
-        [name.trim(), contact_number || null, address || null, openingBal, req.shopId, notesVal]
+        [name.trim(), contact_number || null, emailNorm, address || null, openingBal, req.shopId, notesVal]
       );
     } catch (err) {
-      if (err.code === '42703' && (err.message.includes('notes') || err.column === 'notes')) {
+      if (err.code === '42703' && String(err.message || '').includes('email')) {
         result = await db.query(
-          `INSERT INTO suppliers (name, contact_number, address, opening_balance, status, shop_id)
-           VALUES ($1, $2, $3, $4, 'active', $5)
+          `INSERT INTO suppliers (name, contact_number, address, opening_balance, status, shop_id, notes)
+           VALUES ($1, $2, $3, $4, 'active', $5, $6)
            RETURNING 
              supplier_id,
              name,
@@ -292,18 +313,37 @@ router.post('/', async (req, res) => {
              0 as total_paid,
              opening_balance as current_payable_balance,
              status,
-             created_at`,
-          [name.trim(), contact_number || null, address || null, openingBal, req.shopId]
+             created_at,
+             notes`,
+          [name.trim(), contact_number || null, address || null, openingBal, req.shopId, notesVal]
         );
-      } else if (err.code === '42703' && err.message.includes('address')) {
-        // Address column doesn't exist, insert without it
+      } else if (err.code === '42703' && (err.message.includes('notes') || err.column === 'notes')) {
         result = await db.query(
-          `INSERT INTO suppliers (name, contact_number, opening_balance, status, shop_id)
-           VALUES ($1, $2, $3, 'active', $4)
+          `INSERT INTO suppliers (name, contact_number, email, address, opening_balance, status, shop_id)
+           VALUES ($1, $2, $3, $4, $5, 'active', $6)
            RETURNING 
              supplier_id,
              name,
              contact_number,
+             email,
+             address,
+             opening_balance,
+             0 as total_credit_purchases,
+             0 as total_paid,
+             opening_balance as current_payable_balance,
+             status,
+             created_at`,
+          [name.trim(), contact_number || null, emailNorm, address || null, openingBal, req.shopId]
+        );
+      } else if (err.code === '42703' && err.message.includes('address')) {
+        result = await db.query(
+          `INSERT INTO suppliers (name, contact_number, email, opening_balance, status, shop_id)
+           VALUES ($1, $2, $3, $4, 'active', $5)
+           RETURNING 
+             supplier_id,
+             name,
+             contact_number,
+             email,
              NULL as address,
              opening_balance,
              0 as total_credit_purchases,
@@ -311,7 +351,7 @@ router.post('/', async (req, res) => {
              opening_balance as current_payable_balance,
              status,
              created_at`,
-          [name.trim(), contact_number || null, openingBal, req.shopId]
+          [name.trim(), contact_number || null, emailNorm, openingBal, req.shopId]
         );
       } else {
         throw err;
@@ -325,12 +365,19 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Update supplier (only name, contact, address, opening_balance, status - balance is auto-calculated)
+// Update supplier (name, contact, email, address, opening_balance, status — balance auto-calculated)
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, contact_number, address, opening_balance, status, notes } = req.body;
+    const { name, contact_number, email, address, opening_balance, status, notes } = req.body;
     const notesVal = notes != null && String(notes).trim() !== '' ? String(notes).trim() : null;
+    const emailNorm = normalizeSupplierEmail(email);
+    if (!emailNorm) {
+      return res.status(400).json({ error: 'Supplier email is required' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ error: 'Invalid email address' });
+    }
 
     // Validation
     if (!name || !name.trim()) {
@@ -370,14 +417,16 @@ router.put('/:id', async (req, res) => {
         `UPDATE suppliers 
          SET name = $1, 
              contact_number = $2, 
-             address = $3, 
-             opening_balance = $4,
-             status = COALESCE($5, status)
-         WHERE supplier_id = $6 AND shop_id = $7
+             email = $3,
+             address = $4, 
+             opening_balance = $5,
+             status = COALESCE($6, status)
+         WHERE supplier_id = $7 AND shop_id = $8
          RETURNING 
            supplier_id,
            name,
            contact_number,
+           email,
            address,
            opening_balance,
            COALESCE((
@@ -408,22 +457,23 @@ router.put('/:id', async (req, res) => {
            ) as current_payable_balance,
            status,
            created_at`,
-        [name.trim(), contact_number || null, address || null, finalOpeningBalance, status || 'active', id, req.shopId]
+        [name.trim(), contact_number || null, emailNorm, address || null, finalOpeningBalance, status || 'active', id, req.shopId]
       );
     } catch (err) {
       if (err.code === '42703' && err.message.includes('address')) {
-        // Address column doesn't exist, update without it
         result = await db.query(
           `UPDATE suppliers 
            SET name = $1, 
                contact_number = $2, 
-               opening_balance = $3,
-               status = COALESCE($4, status)
-           WHERE supplier_id = $5 AND shop_id = $6
+               email = $3,
+               opening_balance = $4,
+               status = COALESCE($5, status)
+           WHERE supplier_id = $6 AND shop_id = $7
            RETURNING 
              supplier_id,
              name,
              contact_number,
+             email,
              NULL as address,
              opening_balance,
              COALESCE((
@@ -454,7 +504,7 @@ router.put('/:id', async (req, res) => {
              ) as current_payable_balance,
              status,
              created_at`,
-          [name.trim(), contact_number || null, finalOpeningBalance, status || 'active', id, req.shopId]
+          [name.trim(), contact_number || null, emailNorm, finalOpeningBalance, status || 'active', id, req.shopId]
         );
       } else {
         throw err;

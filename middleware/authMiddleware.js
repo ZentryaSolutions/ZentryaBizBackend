@@ -7,6 +7,31 @@ const db = require('../db');
 const mockSessions = require('../utils/mockSessions');
 const { verifyPassword, verifyPIN } = require('../utils/authUtils');
 const deviceFingerprint = require('../utils/deviceFingerprint');
+let sessionTableReadyPromise = null;
+
+async function ensureUserSessionsTable() {
+  if (sessionTableReadyPromise) return sessionTableReadyPromise;
+  sessionTableReadyPromise = (async () => {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS user_sessions (
+        session_id UUID PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        device_id TEXT,
+        ip_address TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_activity TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_expires_at ON user_sessions(expires_at)`);
+  })().catch((err) => {
+    sessionTableReadyPromise = null;
+    throw err;
+  });
+  return sessionTableReadyPromise;
+}
 
 /**
  * Middleware to check if user is authenticated
@@ -161,6 +186,7 @@ async function verifySession(sessionId) {
     if (!db.isDatabaseConfigured()) {
       return mockSessions.getMockSession(sessionId);
     }
+    await ensureUserSessionsTable();
 
     const result = await db.query(`
       SELECT 
@@ -222,6 +248,7 @@ async function createSession(userId, deviceId, ipAddress, userAgent) {
       'createSession requires database — use mockSessions.createMockSession for no-DB setup'
     );
   }
+  await ensureUserSessionsTable();
 
   const { v4: uuidv4 } = require('uuid');
   const sessionId = uuidv4();

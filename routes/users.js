@@ -630,6 +630,7 @@ router.post('/invitations', async (req, res) => {
       message: `Invitation sent to ${email} for ${storeName}.`,
       type: 'info',
       metadata: { email, role: userRole, shopId: req.shopId },
+      shopId: req.shopId,
     });
 
     res.json({ success: true, message: 'Invitation sent successfully' });

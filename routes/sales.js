@@ -15,34 +15,35 @@ const createNotification = notificationsModule.createNotification || (async () =
 router.use(requireAuth);
 router.use(requireShopContext);
 
-// Generate next invoice number (per shop)
+// Generate next invoice number (per shop) in Bill-0000X format
 async function generateInvoiceNumber(shopId) {
   try {
     const result = await db.query(
       `SELECT invoice_number FROM sales 
-       WHERE invoice_number LIKE 'INV-%' AND shop_id = $1
+       WHERE shop_id = $1
        ORDER BY sale_id DESC LIMIT 1`,
       [shopId]
     );
 
     if (result.rows.length === 0) {
-      return 'INV-0001';
+      return 'Bill-00001';
     }
 
-    const lastInvoice = result.rows[0].invoice_number;
-    const match = lastInvoice.match(/INV-(\d+)/);
+    const lastInvoice = String(result.rows[0].invoice_number || '').trim();
+    // Accept legacy INV-xxxx and newer Bill-xxxxx, continue numeric sequence safely.
+    const match = lastInvoice.match(/(?:INV|Bill)-(\d+)/i);
     
     if (match) {
       const lastNumber = parseInt(match[1]);
       const nextNumber = lastNumber + 1;
-      return `INV-${String(nextNumber).padStart(4, '0')}`;
+      return `Bill-${String(nextNumber).padStart(5, '0')}`;
     }
 
     // Fallback if format doesn't match
-    return `INV-${Date.now()}`;
+    return 'Bill-00001';
   } catch (error) {
     console.error('Error generating invoice number:', error);
-    return `INV-${Date.now()}`;
+    return 'Bill-00001';
   }
 }
 
@@ -381,7 +382,8 @@ router.post('/', async (req, res) => {
         message: `Sale ${invoiceNumber} completed successfully by ${username}. Total: PKR ${grandTotal.toFixed(2)}`,
         type: 'success',
         link: '/sales',
-        metadata: JSON.stringify({ sale_id: saleId, invoice_number: invoiceNumber })
+        metadata: { sale_id: saleId, invoice_number: invoiceNumber, shopId: req.shopId },
+        shopId: req.shopId,
       });
     } catch (notifError) {
       console.error('Error creating notification:', notifError);

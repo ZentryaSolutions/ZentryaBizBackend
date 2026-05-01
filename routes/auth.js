@@ -224,6 +224,8 @@ router.post('/staff-invite/:token/reject', async (req, res) => {
       title: 'Invitation rejected',
       message: `${invite.email} rejected the cashier invitation for ${invite.store_name || 'your store'}.`,
       type: 'warning',
+      metadata: { shopId: invite.shop_id, inviteEmail: invite.email, action: 'reject' },
+      shopId: invite.shop_id,
     });
 
     return res.json({ success: true, message: 'Invitation rejected' });
@@ -342,6 +344,8 @@ router.post('/staff-invite/:token/accept', async (req, res) => {
       title: 'Invitation accepted',
       message: `${email} accepted the invitation and completed registration for ${invite.store_name || 'your store'}.`,
       type: 'success',
+      metadata: { shopId: invite.shop_id, inviteEmail: email, action: 'accept' },
+      shopId: invite.shop_id,
     });
 
     return res.json({ success: true, message: 'Registration completed successfully' });
@@ -366,6 +370,8 @@ router.post('/staff-invite/:token/accept-existing', async (req, res) => {
       title: 'Invitation accepted',
       message: `${linked.email} accepted the invitation for ${invite.store_name || 'your store'} using existing account.`,
       type: 'success',
+      metadata: { shopId: invite.shop_id, inviteEmail: linked.email, action: 'accept_existing' },
+      shopId: invite.shop_id,
     });
 
     return res.json({ success: true, message: 'Invitation accepted. Please log in.' });

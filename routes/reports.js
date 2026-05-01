@@ -694,12 +694,18 @@ router.get('/profit', requireRole('administrator'), requireProPlan, async (req, 
       endDate = range.endDate;
     }
 
-    const params = [];
-    let paramIndex = 1;
-    let dateWhere = '';
-    
+    const sid = req.shopId;
+    const params = [sid];
+    let paramIndex = 2;
+
+    let salesWhere = 'WHERE shop_id = $1';
+    let purchasesWhere = 'WHERE p.shop_id = $1';
+    let expensesWhere = 'WHERE shop_id = $1';
+
     if (startDate && endDate) {
-      dateWhere = `WHERE date >= $${paramIndex} AND date <= $${paramIndex + 1}`;
+      salesWhere += ` AND date >= $${paramIndex} AND date <= $${paramIndex + 1}`;
+      purchasesWhere += ` AND p.date >= $${paramIndex} AND p.date <= $${paramIndex + 1}`;
+      expensesWhere += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
     }
@@ -708,11 +714,10 @@ router.get('/profit', requireRole('administrator'), requireProPlan, async (req, 
     const salesQuery = `
       SELECT COALESCE(SUM(total_amount), 0) as total_sales
       FROM sales
-      ${dateWhere}
+      ${salesWhere}
     `;
 
     // Get Purchases
-    const purchasesWhere = dateWhere.replace(/date/g, 'p.date');
     const purchasesQuery = `
       SELECT COALESCE(SUM(p.total_amount), 0) as total_purchases
       FROM purchases p
@@ -720,7 +725,6 @@ router.get('/profit', requireRole('administrator'), requireProPlan, async (req, 
     `;
 
     // Get Expenses
-    const expensesWhere = dateWhere.replace(/date/g, 'expense_date');
     const expensesQuery = `
       SELECT COALESCE(SUM(amount), 0) as total_expenses
       FROM daily_expenses
@@ -771,19 +775,19 @@ router.get('/expenses-summary', requireRole('administrator'), async (req, res) =
       endDate = range.endDate;
     }
 
-    let whereClause = '';
-    const params = [];
-    let paramIndex = 1;
+    const sid = req.shopId;
+    let whereClause = 'WHERE shop_id = $1';
+    const params = [sid];
+    let paramIndex = 2;
 
     if (startDate && endDate) {
-      whereClause = `WHERE expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
+      whereClause += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
     }
 
     if (category) {
-      whereClause += whereClause ? ' AND' : ' WHERE';
-      whereClause += ` expense_category = $${paramIndex}`;
+      whereClause += ` AND expense_category = $${paramIndex}`;
       params.push(category);
       paramIndex++;
     }
@@ -847,19 +851,19 @@ router.get('/expenses-list', requireRole('administrator'), requireProPlan, async
       endDate = range.endDate;
     }
 
-    let whereClause = '';
-    const params = [];
-    let paramIndex = 1;
+    const sid = req.shopId;
+    let whereClause = 'WHERE shop_id = $1';
+    const params = [sid];
+    let paramIndex = 2;
 
     if (startDate && endDate) {
-      whereClause = `WHERE expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
+      whereClause += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
     }
 
     if (category) {
-      whereClause += whereClause ? ' AND' : ' WHERE';
-      whereClause += ` expense_category = $${paramIndex}`;
+      whereClause += ` AND expense_category = $${paramIndex}`;
       params.push(category);
       paramIndex++;
     }
