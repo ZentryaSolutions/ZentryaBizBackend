@@ -764,6 +764,25 @@ router.post('/zb-simple-session', async (req, res) => {
     });
   } catch (error) {
     console.error('[Auth Route] zb-simple-session error:', error);
+    const msg = String(error?.message || '');
+    const causeMsg = String(error?.cause?.message || '');
+    const combined = `${msg} ${causeMsg}`.toLowerCase();
+    const transientDb =
+      combined.includes('connection terminated') ||
+      combined.includes('connection timeout') ||
+      combined.includes('terminated unexpectedly') ||
+      combined.includes('timeout') ||
+      combined.includes('econnrefused') ||
+      combined.includes('econnreset') ||
+      combined.includes('etimedout') ||
+      combined.includes('ENETUNREACH');
+    if (transientDb) {
+      return res.status(503).json({
+        error: 'Database unreachable',
+        message:
+          'PostgreSQL timed out or dropped the connection while creating your API session. Check DATABASE_URL, Supabase pooler (try port 5432 session mode if 6543 fails), VPN/firewall, or increase DB_CONNECTION_TIMEOUT_MS in backend/.env. Wait a few seconds and log in again.',
+      });
+    }
     res.status(500).json({
       error: 'Session failed',
       message: process.env.NODE_ENV === 'development' ? error.message : 'Could not create API session',

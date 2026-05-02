@@ -18,21 +18,43 @@ function sslOption() {
   return false;
 }
 
+function isLikelyRemotePostgres(connStr, host) {
+  const c = connStr || '';
+  const h = host || '';
+  return (
+    c.includes('supabase') ||
+    c.includes('neon.tech') ||
+    c.includes('amazonaws.com') ||
+    /\.pooler\.supabase/i.test(c) ||
+    h.includes('supabase')
+  );
+}
+
 function buildPoolConfig() {
-  const poolMax = Number(process.env.DB_POOL_MAX) || 5;
-  const idleTimeoutMillis = Number(process.env.DB_IDLE_TIMEOUT_MS) || 10000;
-  const connectionTimeoutMillis = Number(process.env.DB_CONNECTION_TIMEOUT_MS) || 10000;
   const conn = process.env.DATABASE_URL && process.env.DATABASE_URL.trim();
+  const remote = isLikelyRemotePostgres(conn, process.env.DB_HOST || '');
+  // Remote DBs: longer connect/idle timeouts so zb-simple-session survives cold pools & network jitter.
+  const defaultIdleMs = remote ? 60000 : 10000;
+  const defaultConnectMs = remote ? 30000 : 10000;
+  const poolMax = Number(process.env.DB_POOL_MAX) || (remote ? 8 : 5);
+  const idleTimeoutMillis =
+    process.env.DB_IDLE_TIMEOUT_MS !== undefined
+      ? Number(process.env.DB_IDLE_TIMEOUT_MS)
+      : defaultIdleMs;
+  const connectionTimeoutMillis =
+    process.env.DB_CONNECTION_TIMEOUT_MS !== undefined
+      ? Number(process.env.DB_CONNECTION_TIMEOUT_MS)
+      : defaultConnectMs;
   if (conn) {
     return {
       connectionString: conn,
       ssl: conn.includes('supabase') ? { rejectUnauthorized: false } : sslOption(),
-      // Keep this low for pooled/serverless environments (Supabase session/transaction pooler).
       max: poolMax,
       idleTimeoutMillis,
       connectionTimeoutMillis,
       keepAlive: true,
-      allowExitOnIdle: true,
+      // Do not aggressively tear down the pool on idle — avoids stale first query after idle.
+      allowExitOnIdle: remote ? false : true,
     };
   }
 
@@ -52,7 +74,7 @@ function buildPoolConfig() {
     idleTimeoutMillis,
     connectionTimeoutMillis,
     keepAlive: true,
-    allowExitOnIdle: true,
+    allowExitOnIdle: remote ? false : true,
   };
 }
 
@@ -68,8 +90,10 @@ if (pool) {
 const isDatabaseConfigured = () => !!pool;
 
 function isRetriableDbError(error) {
-  const code = error?.code || '';
+  const code = String(error?.code || '').toLowerCase();
   const msg = String(error?.message || '').toLowerCase();
+  const causeMsg = String(error?.cause?.message || '').toLowerCase();
+  const combined = `${msg} ${causeMsg}`;
   return (
     [
       '53300', // too_many_connections
@@ -81,16 +105,21 @@ function isRetriableDbError(error) {
       '08006',
       '08007',
       '08p01',
+      '57p01', // admin_shutdown
       'etimedout',
       'econnreset',
       'econnrefused',
-    ].includes(String(code).toLowerCase()) ||
-    msg.includes('max clients reached') ||
-    msg.includes('emaxconnsession')
+    ].includes(code) ||
+    combined.includes('max clients reached') ||
+    combined.includes('emaxconnsession') ||
+    combined.includes('connection terminated') ||
+    combined.includes('terminated unexpectedly') ||
+    combined.includes('connection timeout') ||
+    combined.includes('client has encountered a connection error')
   );
 }
 
-const query = async (text, params, retries = 3) => {
+const query = async (text, params, retries = 5) => {
   if (!pool) {
     const e = new Error(
       'Database not configured. Set DATABASE_URL or DB_* in backend/.env (see .env.example).'

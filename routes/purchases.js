@@ -164,13 +164,45 @@ router.post('/', async (req, res) => {
         [purchaseId, item_id, quantity, cost_price, subtotal]
       );
 
-      // Update product stock and cost price (if different)
+      // Weighted average cost (WAC) on inbound stock:
+      // newAvg = (oldQty * oldAvg + newQty * newUnitCost) / (oldQty + newQty)
+      // If oldQty <= 0, treat average as the incoming unit cost (fresh stock layer).
+      const productRow = await client.query(
+        `SELECT quantity_in_stock, purchase_price
+         FROM products
+         WHERE product_id = $1 AND shop_id = $2
+         FOR UPDATE`,
+        [item_id, req.shopId]
+      );
+
+      if (productRow.rows.length === 0) {
+        throw new Error(`Product with ID ${item_id} not found`);
+      }
+
+      const oldQty = Number(productRow.rows[0].quantity_in_stock || 0);
+      const oldAvg = Number(productRow.rows[0].purchase_price || 0);
+      const addQty = Number(quantity);
+      const unitCost = Number(cost_price);
+
+      if (!Number.isFinite(addQty) || addQty <= 0) {
+        throw new Error('Quantity must be greater than 0');
+      }
+      if (!Number.isFinite(unitCost) || unitCost <= 0) {
+        throw new Error('Cost price must be greater than 0');
+      }
+
+      const denom = oldQty + addQty;
+      const newAvg =
+        oldQty > 0 && Number.isFinite(oldAvg) && oldAvg > 0
+          ? (oldQty * oldAvg + addQty * unitCost) / denom
+          : unitCost;
+
       await client.query(
         `UPDATE products 
          SET quantity_in_stock = quantity_in_stock + $1,
              purchase_price = $2
          WHERE product_id = $3 AND shop_id = $4`,
-        [quantity, cost_price, item_id, req.shopId]
+        [addQty, newAvg, item_id, req.shopId]
       );
     }
 
