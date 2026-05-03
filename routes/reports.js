@@ -15,6 +15,27 @@ router.use(requireShopContext);
 
 // Removed checkFeature - allow all API calls, frontend handles operation blocking
 
+function ymdFromPgDate(v) {
+  if (v == null || v === '') return '';
+  if (v instanceof Date) {
+    const y = v.getFullYear();
+    const m = String(v.getMonth() + 1).padStart(2, '0');
+    const d = String(v.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  return String(v).slice(0, 10);
+}
+
+function addCalendarDaysYmd(ymd, deltaDays) {
+  const parts = String(ymd).slice(0, 10).split('-').map(Number);
+  const [y, m, d] = parts;
+  const dt = new Date(y, m - 1, d + deltaDays);
+  const yy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
 // Helper function to get date range for periods
 
 // Helper function to get date range for periods
@@ -1244,18 +1265,34 @@ router.get('/supplier-history/:id', requireRole('administrator'), requireProPlan
   }
 });
 
-// Dashboard Data - Today's Status Only
+// Dashboard: today KPIs + rolling week + rolling 30-day window for lists & snapshot (avoids empty May UI when April had sales).
 // Accessible to both administrators and cashiers (cashiers see limited data)
 router.get('/dashboard', async (req, res) => {
   try {
     const isAdmin = isElevatedRole(req.user.role);
     const shopId = req.shopId;
-    // Parallel: business "today" + settings (was two sequential round-trips)
     const settingsQuery = `SELECT other_app_settings FROM settings WHERE shop_id = $1 ORDER BY id LIMIT 1`;
     const [todayDate, settingsResult] = await Promise.all([
       getBusinessTodayDateString(db),
       db.query(settingsQuery, [shopId]),
     ]);
+
+    /** Inclusive last 30 days ending on business today (matches activity / top sellers / snapshot). */
+    const dashPeriodEnd = todayDate;
+    const dashPeriodStart = addCalendarDaysYmd(todayDate, -29);
+    const dashRange = [shopId, dashPeriodStart, dashPeriodEnd];
+    let dashPeriodLabel = 'Last 30 days';
+    try {
+      const [sy, sm, sd] = dashPeriodStart.split('-').map(Number);
+      const [ey, em, ed] = dashPeriodEnd.split('-').map(Number);
+      const ds = new Date(sy, sm - 1, sd);
+      const de = new Date(ey, em - 1, ed);
+      dashPeriodLabel = `${ds.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${de.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+    } catch {
+      /* keep Last 30 days */
+    }
+
+    const weekStart = addCalendarDaysYmd(todayDate, -6);
 
     let openingCash = 0;
     if (settingsResult.rows.length > 0) {
@@ -1265,17 +1302,14 @@ router.get('/dashboard', async (req, res) => {
       }
     }
 
-    // 1. Today Sale - Total sale amount of today only (completed bills, exclude cancelled)
     const todaySalesQuery = `
       SELECT 
         COALESCE(SUM(total_amount), 0) as today_sale,
-        COUNT(*) as bill_count
+        COUNT(*)::int as bill_count
       FROM sales
       WHERE date = $1::date AND shop_id = $2
     `;
 
-    // 2. Today Profit - (Selling Price - Purchase Cost) × Quantity for today's bills
-    // Only calculate for administrators (cashiers don't see profit)
     const todayProfitQuery = isAdmin ? `
       SELECT 
         COALESCE(SUM((si.selling_price - COALESCE(p.purchase_price, 0)) * si.quantity), 0) as today_profit
@@ -1285,15 +1319,18 @@ router.get('/dashboard', async (req, res) => {
       WHERE s.date = $1::date AND s.shop_id = $2
     ` : null;
 
-    // 3. Cash in Hand - Opening cash + Today cash sales + Customer payments (cash) - Supplier payments (cash)
-    // Today cash sales
+    const todayCollectedQuery = `
+      SELECT COALESCE(SUM(paid_amount), 0) AS collected_today
+      FROM sales
+      WHERE date = $1::date AND shop_id = $2
+    `;
+
     const todayCashSalesQuery = `
       SELECT COALESCE(SUM(paid_amount), 0) as cash_sales
       FROM sales
       WHERE date = $1::date AND payment_type = 'cash' AND shop_id = $2
     `;
 
-    // Customer payments received today (cash) — scoped via customer.shop_id
     const customerPaymentsQuery = `
       SELECT COALESCE(SUM(cp.amount), 0) as cash_received
       FROM customer_payments cp
@@ -1303,7 +1340,6 @@ router.get('/dashboard', async (req, res) => {
       AND (cp.payment_method = 'cash' OR cp.payment_method IS NULL)
     `;
 
-    // Supplier payments made today (cash) — scoped via supplier.shop_id
     const supplierPaymentsQuery = `
       SELECT COALESCE(SUM(sp.amount), 0) as cash_paid
       FROM supplier_payments sp
@@ -1313,16 +1349,14 @@ router.get('/dashboard', async (req, res) => {
       AND (sp.payment_method = 'cash' OR sp.payment_method IS NULL)
     `;
 
-    // 4. Customer Due - Sum of all unpaid/remaining amounts from customers
     const customerDueQuery = `
       SELECT 
         COALESCE(SUM(current_balance), 0) as customer_due,
-        COUNT(*) as customer_count
+        COUNT(*)::int as customer_count
       FROM customers
       WHERE current_balance > 0 AND shop_id = $1
     `;
 
-    // 5. Supplier Due — same formula as legacy, but aggregated (avoids per-row correlated subqueries)
     const supplierDueQuery = `
       WITH pur AS (
         SELECT supplier_id, shop_id, SUM(total_amount) AS credit_total
@@ -1349,46 +1383,128 @@ router.get('/dashboard', async (req, res) => {
         AND s.opening_balance + COALESCE(pur.credit_total, 0) - COALESCE(pay.paid_total, 0) > 0
     `;
 
-    // 6. Low Stock Items - Count where Current Stock <= 5 (default threshold)
-    // Use same logic as /reports/stock-low endpoint
     const lowStockQuery = `
-      SELECT 
-        COUNT(*) as low_stock_count
+      SELECT COUNT(*)::int as low_stock_count
       FROM products
       WHERE quantity_in_stock <= 5 AND shop_id = $1
     `;
 
-    // 7. Top 5 Selling Items (today) - by quantity
-    const topSellingQuery = `
+    const lowStockPeekQuery = `
+      SELECT 
+        COALESCE(item_name_english, name) AS product_name,
+        quantity_in_stock::int AS quantity_in_stock
+      FROM products
+      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      ORDER BY quantity_in_stock ASC, product_id ASC
+      LIMIT 1
+    `;
+
+    const weekRange = [shopId, weekStart, todayDate];
+
+    const topSellingMonthQuery = `
       SELECT 
         p.product_id,
-        COALESCE(p.item_name_english, p.name) as product_name,
-        SUM(si.quantity) as quantity_sold
+        COALESCE(p.item_name_english, p.name) AS product_name,
+        MAX(COALESCE(c.category_name, NULLIF(TRIM(p.category), ''), 'General')) AS category_name,
+        SUM(si.quantity)::float AS quantity_sold,
+        SUM(si.quantity * si.selling_price)::float AS revenue,
+        MIN(p.quantity_in_stock)::int AS quantity_in_stock
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.sale_id
       JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
-      WHERE s.date = $1::date AND s.shop_id = $2
+      LEFT JOIN categories c ON p.category_id = c.category_id AND c.shop_id = s.shop_id
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
       GROUP BY p.product_id, p.item_name_english, p.name
-      ORDER BY quantity_sold DESC
+      ORDER BY revenue DESC NULLS LAST
       LIMIT 5
     `;
 
-    // 8. Recent 5 Bills (today)
-    const recentBillsQuery = `
+    const salesMonthQuery = `
       SELECT 
         sale_id,
         invoice_number,
         customer_name,
         total_amount,
+        paid_amount,
+        payment_type,
         date
       FROM sales
-      WHERE date = $1::date AND shop_id = $2
-      ORDER BY date DESC, sale_id DESC
-      LIMIT 5
+      WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+      ORDER BY sale_id DESC
+      LIMIT 20
     `;
 
-    // Execute all queries in parallel (conditionally include profit query for admins)
+    const weekRevenueQuery = `
+      SELECT s.date::date AS d, COALESCE(SUM(s.total_amount), 0)::float AS revenue
+      FROM sales s
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
+      GROUP BY s.date
+    `;
+
+    const weekExpensesQuery = `
+      SELECT e.expense_date::date AS d, COALESCE(SUM(e.amount), 0)::float AS amt
+      FROM daily_expenses e
+      WHERE e.shop_id = $1 AND e.expense_date >= $2::date AND e.expense_date <= $3::date
+      GROUP BY e.expense_date
+    `;
+
+    const weekProfitQuery = isAdmin
+      ? `
+      SELECT s.date::date AS d,
+        COALESCE(SUM((si.selling_price - COALESCE(p.purchase_price, 0)) * si.quantity), 0)::float AS profit
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      LEFT JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
+      GROUP BY s.date
+    `
+      : null;
+
+    const monthSalesAggQuery = `
+      SELECT 
+        COALESCE(SUM(total_amount), 0)::float AS total_sales,
+        COALESCE(SUM(paid_amount), 0)::float AS cash_collected
+      FROM sales
+      WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+    `;
+
+    const monthPurchQuery = `
+      SELECT COALESCE(SUM(total_amount), 0)::float AS total_purchases
+      FROM purchases
+      WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+    `;
+
+    const monthExpQuery = `
+      SELECT COALESCE(SUM(amount), 0)::float AS total_expenses
+      FROM daily_expenses
+      WHERE shop_id = $1 AND expense_date >= $2::date AND expense_date <= $3::date
+    `;
+
+    const monthUnitsSoldQuery = `
+      SELECT COALESCE(SUM(si.quantity), 0)::float AS units
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
+    `;
+
+    const monthInvoiceCountQuery = `
+      SELECT COUNT(*)::int AS c
+      FROM sales
+      WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+    `;
+
+    const activityExpensesQuery = isAdmin
+      ? `
+      SELECT expense_id, expense_category, amount, expense_date, payment_method, notes
+      FROM daily_expenses
+      WHERE shop_id = $1 AND expense_date >= $2::date AND expense_date <= $3::date
+      ORDER BY expense_id DESC
+      LIMIT 12
+    `
+      : null;
+
     const dayParam = [todayDate, shopId];
+
     const queries = [
       db.query(todaySalesQuery, dayParam),
       isAdmin ? db.query(todayProfitQuery, dayParam) : Promise.resolve({ rows: [{ today_profit: 0 }] }),
@@ -1398,8 +1514,19 @@ router.get('/dashboard', async (req, res) => {
       db.query(customerDueQuery, [shopId]),
       isAdmin ? db.query(supplierDueQuery, [shopId]) : Promise.resolve({ rows: [{ supplier_due: 0, supplier_count: 0 }] }),
       db.query(lowStockQuery, [shopId]),
-      db.query(topSellingQuery, dayParam),
-      db.query(recentBillsQuery, dayParam)
+      db.query(lowStockPeekQuery, [shopId]),
+      db.query(todayCollectedQuery, dayParam),
+      db.query(topSellingMonthQuery, dashRange),
+      db.query(salesMonthQuery, dashRange),
+      db.query(weekRevenueQuery, weekRange),
+      db.query(weekExpensesQuery, weekRange),
+      isAdmin ? db.query(weekProfitQuery, weekRange) : Promise.resolve({ rows: [] }),
+      db.query(monthSalesAggQuery, dashRange),
+      db.query(monthPurchQuery, dashRange),
+      db.query(monthExpQuery, dashRange),
+      db.query(monthUnitsSoldQuery, dashRange),
+      db.query(monthInvoiceCountQuery, dashRange),
+      isAdmin ? db.query(activityExpensesQuery, dashRange) : Promise.resolve({ rows: [] }),
     ];
 
     const [
@@ -1411,11 +1538,21 @@ router.get('/dashboard', async (req, res) => {
       customerDueResult,
       supplierDueResult,
       lowStockResult,
-      topSellingResult,
-      recentBillsResult
+      lowStockPeekResult,
+      todayCollectedResult,
+      topSellingMonthResult,
+      salesMonthResult,
+      weekRevenueResult,
+      weekExpensesResult,
+      weekProfitResult,
+      monthSalesAggResult,
+      monthPurchResult,
+      monthExpResult,
+      monthUnitsSoldResult,
+      monthInvoiceCountResult,
+      activityExpensesResult,
     ] = await Promise.all(queries);
 
-    // Calculate cash in hand (only for admins - cashiers don't see this)
     let cashInHand = 0;
     if (isAdmin) {
       const todayCashSales = parseFloat(todayCashSalesResult.rows[0].cash_sales) || 0;
@@ -1424,25 +1561,177 @@ router.get('/dashboard', async (req, res) => {
       cashInHand = openingCash + todayCashSales + customerPayments - supplierPayments;
     }
 
+    const todaySale = parseFloat(todaySalesResult.rows[0].today_sale) || 0;
+    const todayBillCount = parseInt(todaySalesResult.rows[0].bill_count, 10) || 0;
+    const rawTodayProfit = isAdmin ? parseFloat(todayProfitResult.rows[0].today_profit) || 0 : null;
+    const todayProfit = isAdmin ? rawTodayProfit : null;
+    const todayCollected = parseFloat(todayCollectedResult.rows[0].collected_today) || 0;
+    const todayProfitMarginPct =
+      isAdmin && todaySale > 0 && rawTodayProfit != null
+        ? Math.round(((rawTodayProfit / todaySale) * 1000)) / 10
+        : null;
+
+    const dayKeys = [];
+    for (let i = 0; i < 7; i++) {
+      dayKeys.push(addCalendarDaysYmd(weekStart, i));
+    }
+
+    const revMap = {};
+    weekRevenueResult.rows.forEach((r) => {
+      revMap[ymdFromPgDate(r.d)] = parseFloat(r.revenue) || 0;
+    });
+    const expMap = {};
+    weekExpensesResult.rows.forEach((r) => {
+      expMap[ymdFromPgDate(r.d)] = parseFloat(r.amt) || 0;
+    });
+    const profMap = {};
+    weekProfitResult.rows.forEach((r) => {
+      profMap[ymdFromPgDate(r.d)] = parseFloat(r.profit) || 0;
+    });
+
+    const weeklyTrend = {
+      labels: dayKeys.map((d) => {
+        try {
+          const [yy, mm, dd] = d.split('-').map(Number);
+          const dt = new Date(yy, mm - 1, dd);
+          return dt.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        } catch {
+          return d;
+        }
+      }),
+      days: dayKeys,
+      revenue: dayKeys.map((d) => revMap[d] || 0),
+      expenses: dayKeys.map((d) => expMap[d] || 0),
+      profit: isAdmin ? dayKeys.map((d) => profMap[d] || 0) : dayKeys.map(() => 0),
+    };
+
+    const totalSalesM = parseFloat(monthSalesAggResult.rows[0].total_sales) || 0;
+    const cashCollectedM = parseFloat(monthSalesAggResult.rows[0].cash_collected) || 0;
+    const totalPurchasesM = parseFloat(monthPurchResult.rows[0].total_purchases) || 0;
+    const totalExpensesM = parseFloat(monthExpResult.rows[0].total_expenses) || 0;
+    const unitsSoldM = parseFloat(monthUnitsSoldResult.rows[0].units) || 0;
+    const netProfitMonth = isAdmin ? totalSalesM - totalPurchasesM - totalExpensesM : null;
+    const custDue = parseFloat(customerDueResult.rows[0].customer_due) || 0;
+
+    const monthSnapshot = {
+      label: dashPeriodLabel,
+      netProfit: netProfitMonth,
+      totalExpenses: totalExpensesM,
+      creditOutstanding: custDue,
+      cashCollected: cashCollectedM,
+      totalSales: totalSalesM,
+      totalPurchases: totalPurchasesM,
+      unitsSold: unitsSoldM,
+    };
+
+    const lowStockPeekRow = lowStockPeekResult.rows[0];
+    const lowStockPeek =
+      lowStockPeekRow &&
+      typeof lowStockPeekRow.product_name === 'string'
+        ? {
+            product_name: lowStockPeekRow.product_name,
+            quantity_in_stock: parseInt(lowStockPeekRow.quantity_in_stock, 10) || 0,
+            minimum: 5,
+          }
+        : null;
+
+    const salesRowsMonth = salesMonthResult.rows || [];
+    const invoiceCountMonth = parseInt(monthInvoiceCountResult.rows[0]?.c, 10) || 0;
+
+    const fmtBillWhen = (d) => {
+      const ymd = ymdFromPgDate(d);
+      try {
+        const [yy, mm, dd] = ymd.split('-').map(Number);
+        return new Date(yy, mm - 1, dd).toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+        });
+      } catch {
+        return ymd;
+      }
+    };
+
+    const activity = [];
+    salesRowsMonth.forEach((row) => {
+      const total = parseFloat(row.total_amount) || 0;
+      const paid = parseFloat(row.paid_amount) || 0;
+      const due = Math.max(0, total - paid);
+      const inv = row.invoice_number ? `#${String(row.invoice_number)}` : `#${row.sale_id}`;
+      const cust = row.customer_name || 'Walk-in Customer';
+      activity.push({
+        sort: `${ymdFromPgDate(row.date)}#sale#${String(row.sale_id).padStart(9, '0')}`,
+        accent: '#15803d',
+        headline: `New sale ${inv}`,
+        detail: `PKR ${total.toLocaleString('en-US', { maximumFractionDigits: 0 })} to ${cust}. PKR ${paid.toLocaleString('en-US', { maximumFractionDigits: 0 })} collected${due > 0.01 ? `, PKR ${due.toLocaleString('en-US', { maximumFractionDigits: 0 })} outstanding.` : '.'}`,
+        when: fmtBillWhen(row.date),
+      });
+    });
+    (activityExpensesResult.rows || []).forEach((e) => {
+      const amt = parseFloat(e.amount) || 0;
+      const label = e.expense_category || e.notes || 'Expense';
+      activity.push({
+        sort: `${ymdFromPgDate(e.expense_date)}#exp#${String(e.expense_id).padStart(9, '0')}`,
+        accent: '#dc2626',
+        headline: 'Expense added',
+        detail: `${label}, PKR ${amt.toLocaleString('en-US', { maximumFractionDigits: 0 })} (${e.payment_method || 'cash'}).`,
+        when: fmtBillWhen(e.expense_date),
+      });
+    });
+    const lc = parseInt(lowStockResult.rows[0].low_stock_count, 10) || 0;
+    if (lc > 0 && lowStockPeek) {
+      activity.push({
+        sort: `${todayDate}#stock`,
+        accent: '#d97706',
+        headline: 'Low stock alert',
+        detail: `${lowStockPeek.product_name} has ${lowStockPeek.quantity_in_stock} unit(s) (minimum ${lowStockPeek.minimum}).`,
+        when: 'Today',
+      });
+    }
+    activity.sort((a, b) => String(b.sort).localeCompare(String(a.sort)));
+
     res.json({
-      todaySale: parseFloat(todaySalesResult.rows[0].today_sale) || 0,
-      todayProfit: isAdmin ? (parseFloat(todayProfitResult.rows[0].today_profit) || 0) : null,
+      businessToday: todayDate,
+      todaySale,
+      todayBillCount,
+      todayProfit,
+      todayProfitMarginPct,
+      todayCollected,
       cashInHand: isAdmin ? cashInHand : null,
-      customerDue: parseFloat(customerDueResult.rows[0].customer_due) || 0,
-      supplierDue: isAdmin ? (parseFloat(supplierDueResult.rows[0].supplier_due) || 0) : null,
-      lowStockCount: parseInt(lowStockResult.rows[0].low_stock_count) || 0,
-      topSellingItems: topSellingResult.rows.map(row => ({
+      customerDue: custDue,
+      customerDueCustomerCount: parseInt(customerDueResult.rows[0].customer_count, 10) || 0,
+      supplierDue: isAdmin ? parseFloat(supplierDueResult.rows[0].supplier_due) || 0 : null,
+      lowStockCount: lc,
+      lowStockPeek,
+      topSellingItems: topSellingMonthResult.rows.map((row) => ({
         product_id: row.product_id,
         product_name: row.product_name,
-        quantity_sold: parseInt(row.quantity_sold) || 0
+        category_name: row.category_name || 'General',
+        quantity_sold: Math.round(parseFloat(row.quantity_sold) || 0),
+        revenue: parseFloat(row.revenue) || 0,
+        quantity_in_stock: parseInt(row.quantity_in_stock, 10) || 0,
       })),
-      recentBills: recentBillsResult.rows.map(row => ({
-        sale_id: row.sale_id,
-        invoice_number: row.invoice_number,
-        customer_name: row.customer_name || '-',
-        total_amount: parseFloat(row.total_amount) || 0,
-        date: row.date
-      }))
+      recentBills: salesRowsMonth.slice(0, 8).map((row) => {
+        const total = parseFloat(row.total_amount) || 0;
+        const paid = parseFloat(row.paid_amount) || 0;
+        return {
+          sale_id: row.sale_id,
+          invoice_number: row.invoice_number,
+          customer_name: row.customer_name || '-',
+          total_amount: total,
+          paid_amount: paid,
+          payment_type: row.payment_type || 'cash',
+          date: row.date,
+          due_remaining: Math.max(0, total - paid),
+        };
+      }),
+      billsMonthTotals: {
+        invoiceCount: invoiceCountMonth,
+        totalOutstanding: custDue,
+      },
+      weeklyTrend,
+      monthSnapshot,
+      activity: activity.slice(0, 14),
     });
   } catch (error) {
     console.error('Error fetching dashboard data:', error);

@@ -526,6 +526,79 @@ router.post('/zb-reset-password-after-otp', async (req, res) => {
 });
 
 /**
+ * POST /api/auth/zb-change-password
+ * Zentrya browser login: verify current password on zb_simple_users (pgcrypto), update crypt hash + linked users row (bcrypt).
+ */
+router.post('/zb-change-password', async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body || {};
+    const em = normalizeEmail(email);
+    const cur = String(currentPassword ?? '');
+    const nw = String(newPassword ?? '');
+
+    if (!db.isDatabaseConfigured()) {
+      return res.status(503).json({
+        error: 'Database not configured',
+        message:
+          'The server is not connected to your database. Use “Forgot password” on sign-in or try again later.',
+      });
+    }
+    if (!em || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+    if (!cur) {
+      return res.status(400).json({ error: 'Enter your current password' });
+    }
+    const pwdVal = validatePassword(nw);
+    if (!pwdVal.valid) {
+      return res.status(400).json({ error: pwdVal.message || 'Invalid new password' });
+    }
+
+    let zbVerify;
+    try {
+      zbVerify = await db.query(
+        `SELECT id, username FROM public.zb_simple_users
+         WHERE lower(trim(coalesce(email,''))) = $1
+           AND password_hash = crypt($2::text, password_hash)`,
+        [em, cur]
+      );
+    } catch (e) {
+      if (e.code === '42P01') {
+        return res.status(503).json({ error: 'Account store not ready', message: 'zb_simple_users table missing.' });
+      }
+      throw e;
+    }
+
+    if (zbVerify.rows.length === 0) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const zbId = zbVerify.rows[0].id;
+    const uname = String(zbVerify.rows[0].username || '').trim().toLowerCase();
+
+    await db.query(
+      `UPDATE public.zb_simple_users SET password_hash = crypt($1::text, gen_salt('bf'::text)) WHERE id = $2::uuid`,
+      [nw, zbId]
+    );
+
+    const bcryptHash = await hashPassword(nw);
+    await db.query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW()
+       WHERE is_active = true AND (zb_profile_id = $2::uuid OR lower(trim(username)) = $3)`,
+      [bcryptHash, zbId, uname]
+    );
+
+    return res.json({ ok: true, message: 'Password updated' });
+  } catch (error) {
+    console.error('[Auth Route] zb-change-password error:', error);
+    res.status(500).json({
+      error: 'Password change failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+});
+
+/**
  * POST /api/auth/login
  * Login with username/password or PIN
  */
