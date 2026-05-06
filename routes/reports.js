@@ -45,22 +45,24 @@ function getDateRange(period) {
   let startDate, endDate;
 
   switch (period) {
+    case 'today':
     case 'daily':
       startDate = new Date(today);
       endDate = new Date(today);
       endDate.setHours(23, 59, 59, 999);
       break;
 
-    case 'weekly':
-      // Get start of current week (Monday)
-      const dayOfWeek = now.getDay();
-      const diff = now.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
-      startDate = new Date(now.setDate(diff));
-      startDate.setHours(0, 0, 0, 0);
-      endDate = new Date(startDate);
-      endDate.setDate(startDate.getDate() + 6);
-      endDate.setHours(23, 59, 59, 999);
+    case 'weekly': {
+      // Last 7 calendar days inclusive (matches Reports UI rolling week)
+      const end = new Date(today);
+      end.setHours(23, 59, 59, 999);
+      const start = new Date(today);
+      start.setDate(today.getDate() - 6);
+      start.setHours(0, 0, 0, 0);
+      startDate = start;
+      endDate = end;
       break;
+    }
 
     case 'monthly':
       startDate = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -114,6 +116,14 @@ function formatYmd(d) {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+/** Parse query start_date/end_date as calendar YYYY-MM-DD for safe SQL ::date filters */
+function ymdRangeFromQuery(start_date, end_date) {
+  const s = String(start_date || '').trim().slice(0, 10);
+  const e = String(end_date || '').trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || !/^\d{4}-\d{2}-\d{2}$/.test(e)) return null;
+  return { startYmd: s, endYmd: e };
 }
 
 // Get comprehensive report with sales, purchases, and cash - Admin only
@@ -525,12 +535,78 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
       WHERE current_balance > 0 AND shop_id = $1
     `;
 
+    const salesByDayQuery = `
+      SELECT
+        s.date::date AS d,
+        COALESCE(SUM(s.total_amount), 0)::float AS revenue,
+        COALESCE(SUM(
+          CASE
+            WHEN s.payment_type = 'cash' THEN s.total_amount
+            WHEN s.payment_type = 'split' THEN COALESCE(s.paid_amount, 0)
+            ELSE 0
+          END
+        ), 0)::float AS cash_day,
+        COALESCE(SUM(
+          CASE
+            WHEN s.payment_type = 'credit' THEN s.total_amount
+            WHEN s.payment_type = 'split' THEN GREATEST(s.total_amount - COALESCE(s.paid_amount, 0), 0)
+            ELSE 0
+          END
+        ), 0)::float AS credit_day
+      FROM sales s
+      ${dateWhereSales.replace(/^WHERE shop_id/, 'WHERE s.shop_id').replace(/ AND date /g, ' AND s.date ')}
+      GROUP BY (s.date::date)
+      ORDER BY (s.date::date) ASC
+    `;
+
+    const expenseCategoryDashQuery = `
+      SELECT 
+        expense_category,
+        COALESCE(SUM(amount), 0)::float AS category_total
+      FROM daily_expenses
+      ${dateWhereExpenses}
+      GROUP BY expense_category
+      ORDER BY category_total DESC
+      LIMIT 12
+    `;
+
+    const lowStockCountQuery = `
+      SELECT COUNT(*)::int AS c
+      FROM products
+      WHERE quantity_in_stock <= 5 AND shop_id = $1
+    `;
+
+    const lowStockTopQuery = `
+      SELECT
+        product_id,
+        COALESCE(item_name_english, name) AS product_name,
+        quantity_in_stock::int AS qty
+      FROM products
+      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      ORDER BY quantity_in_stock ASC, product_id ASC
+      LIMIT 6
+    `;
+
     const creditParams = [sid];
-    const [salesResult, purchasesResult, expensesResult, creditResult] = await Promise.all([
+    const lowStockParams = [sid];
+    const [
+      salesResult,
+      purchasesResult,
+      expensesResult,
+      creditResult,
+      salesByDayResult,
+      expenseCatResult,
+      lowStockCountResult,
+      lowStockTopResult,
+    ] = await Promise.all([
       db.query(salesQuery, params),
       db.query(purchasesQuery, params),
       db.query(expensesQuery, params),
-      db.query(creditQuery, creditParams)
+      db.query(creditQuery, creditParams),
+      db.query(salesByDayQuery, params),
+      db.query(expenseCategoryDashQuery, params),
+      db.query(lowStockCountQuery, lowStockParams),
+      db.query(lowStockTopQuery, lowStockParams),
     ]);
 
     const totalSales = parseFloat(salesResult.rows[0].total_sales) || 0;
@@ -539,6 +615,25 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
     const netProfit = totalSales - totalPurchases - totalExpenses;
     const cashReceived = parseFloat(salesResult.rows[0].cash_received) || 0;
     const creditGiven = parseFloat(creditResult.rows[0].total_credit_given) || 0;
+
+    const salesTrend = (salesByDayResult.rows || []).map((row) => ({
+      date: row.d instanceof Date ? row.d.toISOString().slice(0, 10) : String(row.d).slice(0, 10),
+      revenue: parseFloat(row.revenue) || 0,
+      cash: parseFloat(row.cash_day) || 0,
+      credit: parseFloat(row.credit_day) || 0,
+    }));
+
+    const expenseCategoryBreakdown = (expenseCatResult.rows || []).map((row) => ({
+      category: row.expense_category || 'Other',
+      total: parseFloat(row.category_total) || 0,
+    }));
+
+    const lowStockCount = parseInt(lowStockCountResult.rows[0]?.c, 10) || 0;
+    const lowStockPreview = (lowStockTopResult.rows || []).map((row) => ({
+      product_id: row.product_id,
+      product_name: row.product_name,
+      current_qty: row.qty,
+    }));
 
     res.json({
       totalSales,
@@ -550,6 +645,10 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
       invoiceCount: parseInt(salesResult.rows[0].invoice_count) || 0,
       cashSales: parseFloat(salesResult.rows[0].cash_sales) || 0,
       creditSales: parseFloat(salesResult.rows[0].credit_sales) || 0,
+      salesTrend,
+      expenseCategoryBreakdown,
+      lowStockCount,
+      lowStockPreview,
       dateRange: {
         start: rangeStartForJson instanceof Date ? rangeStartForJson.toISOString() : rangeStartForJson,
         end: rangeEndForJson instanceof Date ? rangeEndForJson.toISOString() : rangeEndForJson
@@ -558,6 +657,212 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
   } catch (error) {
     console.error('Error fetching dashboard summary:', error);
     res.status(500).json({ error: 'Failed to fetch dashboard summary', message: error.message });
+  }
+});
+
+// Sales invoices in range (stacked cash/credit + table)
+router.get('/sales-invoices', requireRole('administrator'), async (req, res) => {
+  try {
+    const { period = 'monthly', start_date, end_date, product_id } = req.query;
+    let startDate;
+    let endDate;
+    if (start_date && end_date) {
+      startDate = new Date(start_date);
+      endDate = new Date(end_date);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      const range = getDateRange(period);
+      startDate = range.startDate;
+      endDate = range.endDate;
+    }
+    const sid = req.shopId;
+    const params = [sid];
+    let where = 'WHERE s.shop_id = $1';
+    let i = 2;
+    if (startDate && endDate) {
+      where += ` AND s.date >= $${i} AND s.date <= $${i + 1}`;
+      params.push(startDate, endDate);
+      i += 2;
+    }
+    if (product_id) {
+      where += ` AND EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = s.sale_id AND si.product_id = $${i})`;
+      params.push(parseInt(product_id, 10));
+      i += 1;
+    }
+    const q = `
+      SELECT
+        s.sale_id,
+        s.invoice_number,
+        s.date::date AS sale_date,
+        s.total_amount,
+        s.paid_amount,
+        s.payment_type,
+        CASE
+          WHEN s.payment_type = 'cash' THEN s.total_amount
+          WHEN s.payment_type = 'split' THEN COALESCE(s.paid_amount, 0)
+          ELSE 0
+        END::float AS cash_amount,
+        CASE
+          WHEN s.payment_type = 'credit' THEN s.total_amount
+          WHEN s.payment_type = 'split' THEN GREATEST(s.total_amount - COALESCE(s.paid_amount, 0), 0)
+          ELSE 0
+        END::float AS credit_amount
+      FROM sales s
+      ${where}
+      ORDER BY s.date DESC, s.sale_id DESC
+      LIMIT 200
+    `;
+    const result = await db.query(q, params);
+    const invoices = result.rows.map((row) => {
+      const total = parseFloat(row.total_amount) || 0;
+      const creditAmt = parseFloat(row.credit_amount) || 0;
+      const paid = parseFloat(row.paid_amount) || 0;
+      let status = 'Paid';
+      if (row.payment_type === 'credit' && creditAmt > 0) status = creditAmt <= 0.01 ? 'Paid' : 'Open';
+      else if (row.payment_type === 'split') status = creditAmt > 0.01 ? 'Partial' : 'Paid';
+      else if (row.payment_type === 'cash') status = 'Paid';
+      return {
+        sale_id: row.sale_id,
+        invoice_number: row.invoice_number,
+        date: row.sale_date,
+        total,
+        cash: parseFloat(row.cash_amount) || 0,
+        credit: creditAmt,
+        payment_type: row.payment_type,
+        status,
+      };
+    });
+    res.json({ invoices, dateRange: { start: startDate?.toISOString(), end: endDate?.toISOString() } });
+  } catch (error) {
+    console.error('Error fetching sales invoices:', error);
+    res.status(500).json({ error: 'Failed to fetch sales invoices', message: error.message });
+  }
+});
+
+// Customer analytics (KPIs for period + optional table support)
+router.get('/customers-analytics', requireRole('administrator'), async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const sid = req.shopId;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: 'start_date and end_date are required' });
+    }
+    const startYmd = String(start_date).slice(0, 10);
+    const endYmd = String(end_date).slice(0, 10);
+    const params = [sid, startYmd, endYmd];
+    const [cnt, coll, creditSales, outQ] = await Promise.all([
+      db.query('SELECT COUNT(*)::int AS c FROM customers WHERE shop_id = $1', [sid]),
+      db.query(
+        `SELECT COALESCE(SUM(cp.amount), 0)::float AS v
+         FROM customer_payments cp
+         INNER JOIN customers c ON c.customer_id = cp.customer_id AND c.shop_id = $1
+         WHERE cp.payment_date >= $2::date AND cp.payment_date <= $3::date`,
+        params
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(total_amount), 0)::float AS v
+         FROM sales
+         WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+           AND payment_type IN ('credit', 'split')`,
+        params
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(CASE WHEN current_balance > 0 THEN current_balance ELSE 0 END), 0)::float AS v
+         FROM customers WHERE shop_id = $1`,
+        [sid]
+      ),
+    ]);
+    const totalCustomers = parseInt(cnt.rows[0].c, 10) || 0;
+    const totalCollected = parseFloat(coll.rows[0].v) || 0;
+    const totalCreditSales = parseFloat(creditSales.rows[0].v) || 0;
+    const outstanding = parseFloat(outQ.rows[0].v) || 0;
+    const denom = totalCollected + outstanding;
+    const collectionRatePct = denom > 0 ? Math.round((totalCollected / denom) * 1000) / 10 : 0;
+    res.json({
+      totalCustomers,
+      totalCreditSales,
+      totalCollected,
+      outstanding,
+      collectionRatePct,
+    });
+  } catch (error) {
+    console.error('Error fetching customers analytics:', error);
+    res.status(500).json({ error: 'Failed to fetch customers analytics', message: error.message });
+  }
+});
+
+// Supplier analytics + purchases in period
+router.get('/suppliers-analytics', requireRole('administrator'), async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const sid = req.shopId;
+    if (!start_date || !end_date) {
+      return res.status(400).json({ error: 'start_date and end_date are required' });
+    }
+    const startYmd = String(start_date).slice(0, 10);
+    const endYmd = String(end_date).slice(0, 10);
+    const params = [sid, startYmd, endYmd];
+    const [supCnt, purch, paid, purchasesList] = await Promise.all([
+      db.query('SELECT COUNT(*)::int AS c FROM suppliers WHERE shop_id = $1', [sid]),
+      db.query(
+        `SELECT COALESCE(SUM(total_amount), 0)::float AS v FROM purchases WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date`,
+        params
+      ),
+      db.query(
+        `SELECT COALESCE(SUM(sp.amount), 0)::float AS v
+         FROM supplier_payments sp
+         INNER JOIN suppliers s ON s.supplier_id = sp.supplier_id AND s.shop_id = $1
+         WHERE sp.payment_date >= $2::date AND sp.payment_date <= $3::date`,
+        params
+      ),
+      db.query(
+        `SELECT
+           p.purchase_id,
+           p.date::date AS purchase_date,
+           p.total_amount,
+           p.payment_type,
+           s.name AS supplier_name
+         FROM purchases p
+         INNER JOIN suppliers s ON s.supplier_id = p.supplier_id AND s.shop_id = p.shop_id
+         WHERE p.shop_id = $1 AND p.date >= $2::date AND p.date <= $3::date
+         ORDER BY p.date DESC, p.purchase_id DESC
+         LIMIT 100`,
+        params
+      ),
+    ]);
+    const payRows = await db.query(
+      `SELECT
+         s.supplier_id,
+         s.name,
+         (s.opening_balance +
+          COALESCE((SELECT SUM(total_amount) FROM purchases pu WHERE pu.supplier_id = s.supplier_id AND pu.shop_id = s.shop_id AND pu.payment_type = 'credit'), 0) -
+          COALESCE((SELECT SUM(amount) FROM supplier_payments sp WHERE sp.supplier_id = s.supplier_id), 0)
+         )::float AS payable
+       FROM suppliers s
+       WHERE s.shop_id = $1`,
+      [sid]
+    );
+    let outstanding = 0;
+    payRows.rows.forEach((r) => {
+      const b = parseFloat(r.payable) || 0;
+      if (b > 0) outstanding += b;
+    });
+    res.json({
+      supplierCount: parseInt(supCnt.rows[0].c, 10) || 0,
+      totalPurchased: parseFloat(purch.rows[0].v) || 0,
+      totalPaid: parseFloat(paid.rows[0].v) || 0,
+      outstandingPayable: outstanding,
+      purchases: purchasesList.rows.map((row) => ({
+        purchase_id: row.purchase_id,
+        date: row.purchase_date,
+        supplier_name: row.supplier_name,
+        total_amount: parseFloat(row.total_amount) || 0,
+        payment_type: row.payment_type,
+      })),
+    });
+  } catch (error) {
+    console.error('Error fetching suppliers analytics:', error);
+    res.status(500).json({ error: 'Failed to fetch suppliers analytics', message: error.message });
   }
 });
 
@@ -578,26 +883,25 @@ router.get('/sales-summary', requireRole('administrator'), async (req, res) => {
       endDate = range.endDate;
     }
 
-    let whereClause = '';
-    const params = [];
-    let paramIndex = 1;
+    const sid = req.shopId;
+    let whereClause = 'WHERE s.shop_id = $1';
+    const params = [sid];
+    let paramIndex = 2;
 
     if (startDate && endDate) {
-      whereClause = `WHERE s.date >= $${paramIndex} AND s.date <= $${paramIndex + 1}`;
+      whereClause += ` AND s.date >= $${paramIndex} AND s.date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
     }
 
     if (product_id) {
-      whereClause += whereClause ? ' AND' : ' WHERE';
-      whereClause += ` EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = s.sale_id AND si.product_id = $${paramIndex})`;
+      whereClause += ` AND EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = s.sale_id AND si.product_id = $${paramIndex})`;
       params.push(parseInt(product_id));
       paramIndex++;
     }
 
     if (customer_id) {
-      whereClause += whereClause ? ' AND' : ' WHERE';
-      whereClause += ` s.customer_id = $${paramIndex}`;
+      whereClause += ` AND s.customer_id = $${paramIndex}`;
       params.push(parseInt(customer_id));
       paramIndex++;
     }
@@ -647,9 +951,10 @@ router.get('/sales-by-product', requireRole('administrator'), requireProPlan, as
       endDate = range.endDate;
     }
 
+    const sid = req.shopId;
     let dateWhere = '';
-    const params = [];
-    let paramIndex = 1;
+    const params = [sid];
+    let paramIndex = 2;
 
     if (startDate && endDate) {
       dateWhere = `AND s.date >= $${paramIndex} AND s.date <= $${paramIndex + 1}`;
@@ -672,8 +977,8 @@ router.get('/sales-by-product', requireRole('administrator'), requireProPlan, as
         COALESCE(SUM(si.quantity * si.selling_price), 0) as total_sale_amount
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.sale_id
-      JOIN products p ON si.product_id = p.product_id
-      WHERE 1=1 ${dateWhere} ${productFilter}
+      JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
+      WHERE s.shop_id = $1 ${dateWhere} ${productFilter}
       GROUP BY p.product_id, p.item_name_english, p.name
       ORDER BY total_sale_amount DESC
     `;
@@ -700,7 +1005,7 @@ router.get('/sales-by-product', requireRole('administrator'), requireProPlan, as
 
 // Profit Report (Simple - Sales - Purchases - Expenses)
 // Profit Report - Admin only
-router.get('/profit', requireRole('administrator'), requireProPlan, async (req, res) => {
+router.get('/profit', requireRole('administrator'), async (req, res) => {
   try {
     const { period = 'monthly', start_date, end_date } = req.query;
     
@@ -752,22 +1057,97 @@ router.get('/profit', requireRole('administrator'), requireProPlan, async (req, 
       ${expensesWhere}
     `;
 
-    const [salesResult, purchasesResult, expensesResult] = await Promise.all([
+    const salesDailyQ = `
+      SELECT (date::date) AS d, COALESCE(SUM(total_amount), 0)::float AS rev
+      FROM sales ${salesWhere}
+      GROUP BY (date::date)
+      ORDER BY (date::date) ASC
+    `;
+    const purchDailyQ = `
+      SELECT (p.date::date) AS d, COALESCE(SUM(p.total_amount), 0)::float AS amt
+      FROM purchases p ${purchasesWhere}
+      GROUP BY (p.date::date)
+      ORDER BY (p.date::date) ASC
+    `;
+    const expDailyQ = `
+      SELECT (expense_date::date) AS d, COALESCE(SUM(amount), 0)::float AS amt
+      FROM daily_expenses ${expensesWhere}
+      GROUP BY (expense_date::date)
+      ORDER BY (expense_date::date) ASC
+    `;
+    const expCatQ = `
+      SELECT expense_category, COALESCE(SUM(amount), 0)::float AS cat_total
+      FROM daily_expenses ${expensesWhere}
+      GROUP BY expense_category
+      ORDER BY cat_total DESC
+      LIMIT 12
+    `;
+
+    const [
+      salesResult,
+      purchasesResult,
+      expensesResult,
+      salesDailyR,
+      purchDailyR,
+      expDailyR,
+      expCatR,
+    ] = await Promise.all([
       db.query(salesQuery, params),
       db.query(purchasesQuery, params),
-      db.query(expensesQuery, params)
+      db.query(expensesQuery, params),
+      db.query(salesDailyQ, params),
+      db.query(purchDailyQ, params),
+      db.query(expDailyQ, params),
+      db.query(expCatQ, params),
     ]);
 
     const totalSales = parseFloat(salesResult.rows[0].total_sales) || 0;
     const totalPurchases = parseFloat(purchasesResult.rows[0].total_purchases) || 0;
     const totalExpenses = parseFloat(expensesResult.rows[0].total_expenses) || 0;
     const netProfit = totalSales - totalPurchases - totalExpenses;
+    const grossProfit = totalSales - totalPurchases;
+    const netMarginPct = totalSales > 0 ? Math.round((netProfit / totalSales) * 1000) / 10 : 0;
+    const expenseRatioPct = totalSales > 0 ? Math.round((totalExpenses / totalSales) * 1000) / 10 : 0;
+
+    const revMap = {};
+    salesDailyR.rows.forEach((row) => {
+      const k = ymdFromPgDate(row.d);
+      revMap[k] = parseFloat(row.rev) || 0;
+    });
+    const purchMap = {};
+    purchDailyR.rows.forEach((row) => {
+      const k = ymdFromPgDate(row.d);
+      purchMap[k] = parseFloat(row.amt) || 0;
+    });
+    const expMap = {};
+    expDailyR.rows.forEach((row) => {
+      const k = ymdFromPgDate(row.d);
+      expMap[k] = parseFloat(row.amt) || 0;
+    });
+    const allDays = new Set([...Object.keys(revMap), ...Object.keys(purchMap), ...Object.keys(expMap)]);
+    const profitTrend = [...allDays].sort().map((d) => {
+      const rev = revMap[d] || 0;
+      const pc = purchMap[d] || 0;
+      const ex = expMap[d] || 0;
+      const costs = pc + ex;
+      return { date: d, revenue: rev, costs, net: rev - costs };
+    });
+
+    const expenseCategoryBreakdown = expCatR.rows.map((row) => ({
+      category: row.expense_category || 'Other',
+      total: parseFloat(row.cat_total) || 0,
+    }));
 
     res.json({
       totalSales,
       totalPurchases,
       totalExpenses,
       netProfit,
+      grossProfit,
+      netMarginPct,
+      expenseRatioPct,
+      profitTrend,
+      expenseCategoryBreakdown,
       dateRange: {
         start: startDate ? startDate.toISOString() : null,
         end: endDate ? endDate.toISOString() : null
@@ -784,12 +1164,20 @@ router.get('/profit', requireRole('administrator'), requireProPlan, async (req, 
 router.get('/expenses-summary', requireRole('administrator'), async (req, res) => {
   try {
     const { period = 'monthly', start_date, end_date, category } = req.query;
-    
-    let startDate, endDate;
+
+    let startDate = null;
+    let endDate = null;
+    let expenseYmdBounds = null;
     if (start_date && end_date) {
-      startDate = new Date(start_date);
-      endDate = new Date(end_date);
-      endDate.setHours(23, 59, 59, 999);
+      expenseYmdBounds = ymdRangeFromQuery(start_date, end_date);
+      if (expenseYmdBounds) {
+        startDate = new Date(`${expenseYmdBounds.startYmd}T12:00:00`);
+        endDate = new Date(`${expenseYmdBounds.endYmd}T12:00:00`);
+      } else {
+        startDate = new Date(start_date);
+        endDate = new Date(end_date);
+        endDate.setHours(23, 59, 59, 999);
+      }
     } else {
       const range = getDateRange(period);
       startDate = range.startDate;
@@ -801,7 +1189,11 @@ router.get('/expenses-summary', requireRole('administrator'), async (req, res) =
     const params = [sid];
     let paramIndex = 2;
 
-    if (startDate && endDate) {
+    if (expenseYmdBounds) {
+      whereClause += ` AND expense_date::date >= $${paramIndex}::date AND expense_date::date <= $${paramIndex + 1}::date`;
+      params.push(expenseYmdBounds.startYmd, expenseYmdBounds.endYmd);
+      paramIndex += 2;
+    } else if (startDate && endDate) {
       whereClause += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
@@ -846,9 +1238,17 @@ router.get('/expenses-summary', requireRole('administrator'), async (req, res) =
         count: parseInt(row.category_count) || 0
       })),
       dateRange: {
-        start: startDate ? startDate.toISOString() : null,
-        end: endDate ? endDate.toISOString() : null
-      }
+        start: expenseYmdBounds
+          ? `${expenseYmdBounds.startYmd}T00:00:00.000Z`
+          : startDate
+            ? startDate.toISOString()
+            : null,
+        end: expenseYmdBounds
+          ? `${expenseYmdBounds.endYmd}T23:59:59.999Z`
+          : endDate
+            ? endDate.toISOString()
+            : null,
+      },
     });
   } catch (error) {
     console.error('Error fetching expenses summary:', error);
@@ -860,12 +1260,20 @@ router.get('/expenses-summary', requireRole('administrator'), async (req, res) =
 router.get('/expenses-list', requireRole('administrator'), requireProPlan, async (req, res) => {
   try {
     const { period = 'monthly', start_date, end_date, category } = req.query;
-    
-    let startDate, endDate;
+
+    let startDate = null;
+    let endDate = null;
+    let expenseYmdBounds = null;
     if (start_date && end_date) {
-      startDate = new Date(start_date);
-      endDate = new Date(end_date);
-      endDate.setHours(23, 59, 59, 999);
+      expenseYmdBounds = ymdRangeFromQuery(start_date, end_date);
+      if (expenseYmdBounds) {
+        startDate = new Date(`${expenseYmdBounds.startYmd}T12:00:00`);
+        endDate = new Date(`${expenseYmdBounds.endYmd}T12:00:00`);
+      } else {
+        startDate = new Date(start_date);
+        endDate = new Date(end_date);
+        endDate.setHours(23, 59, 59, 999);
+      }
     } else {
       const range = getDateRange(period);
       startDate = range.startDate;
@@ -877,7 +1285,11 @@ router.get('/expenses-list', requireRole('administrator'), requireProPlan, async
     const params = [sid];
     let paramIndex = 2;
 
-    if (startDate && endDate) {
+    if (expenseYmdBounds) {
+      whereClause += ` AND expense_date::date >= $${paramIndex}::date AND expense_date::date <= $${paramIndex + 1}::date`;
+      params.push(expenseYmdBounds.startYmd, expenseYmdBounds.endYmd);
+      paramIndex += 2;
+    } else if (startDate && endDate) {
       whereClause += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
@@ -908,9 +1320,17 @@ router.get('/expenses-list', requireRole('administrator'), requireProPlan, async
     res.json({
       expenses: result.rows,
       dateRange: {
-        start: startDate ? startDate.toISOString() : null,
-        end: endDate ? endDate.toISOString() : null
-      }
+        start: expenseYmdBounds
+          ? `${expenseYmdBounds.startYmd}T00:00:00.000Z`
+          : startDate
+            ? startDate.toISOString()
+            : null,
+        end: expenseYmdBounds
+          ? `${expenseYmdBounds.endYmd}T23:59:59.999Z`
+          : endDate
+            ? endDate.toISOString()
+            : null,
+      },
     });
   } catch (error) {
     console.error('Error fetching expenses list:', error);

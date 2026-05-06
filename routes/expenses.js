@@ -4,27 +4,54 @@ const db = require('../db');
 const { requireAuth, requireRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
 
+/** Store <input type="date"> as plain YYYY-MM-DD — avoids JS Date UTC shift vs list filters */
+function expenseDateForDb(input) {
+  if (input == null || input === '') return null;
+  const s = String(input).trim();
+  const ymd = s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const t = Date.parse(s);
+  if (Number.isNaN(t)) return null;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
 // Expenses management is admin-only (cashiers cannot manage expenses)
 router.use(requireAuth);
 router.use(requireShopContext);
 router.use(requireRole('administrator'));
 
+function ymdOrNull(q) {
+  const s = String(q || '').trim().slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
 // Get all expenses with optional date filter
 router.get('/', async (req, res) => {
   try {
     const { start_date, end_date, category } = req.query;
-    
+
+    const startYmd = ymdOrNull(start_date);
+    const endYmd = ymdOrNull(end_date);
+
     let query = 'SELECT * FROM daily_expenses WHERE shop_id = $1';
     const params = [req.shopId];
     let paramIndex = 2;
 
-    if (start_date) {
+    if (startYmd) {
+      query += ` AND expense_date::date >= $${paramIndex}::date`;
+      params.push(startYmd);
+      paramIndex++;
+    } else if (start_date) {
       query += ` AND expense_date >= $${paramIndex}`;
       params.push(start_date);
       paramIndex++;
     }
 
-    if (end_date) {
+    if (endYmd) {
+      query += ` AND expense_date::date <= $${paramIndex}::date`;
+      params.push(endYmd);
+      paramIndex++;
+    } else if (end_date) {
       query += ` AND expense_date <= $${paramIndex}`;
       params.push(end_date);
       paramIndex++;
@@ -62,13 +89,24 @@ router.get('/summary', async (req, res) => {
     const params = [req.shopId];
     let paramIndex = 2;
 
-    if (start_date) {
+    const sumStartYmd = ymdOrNull(start_date);
+    const sumEndYmd = ymdOrNull(end_date);
+
+    if (sumStartYmd) {
+      query += ` AND expense_date::date >= $${paramIndex}::date`;
+      params.push(sumStartYmd);
+      paramIndex++;
+    } else if (start_date) {
       query += ` AND expense_date >= $${paramIndex}`;
       params.push(start_date);
       paramIndex++;
     }
 
-    if (end_date) {
+    if (sumEndYmd) {
+      query += ` AND expense_date::date <= $${paramIndex}::date`;
+      params.push(sumEndYmd);
+      paramIndex++;
+    } else if (end_date) {
       query += ` AND expense_date <= $${paramIndex}`;
       params.push(end_date);
       paramIndex++;
@@ -145,12 +183,12 @@ router.post('/', async (req, res) => {
       throw new Error('Amount must be greater than 0');
     }
 
-    const expenseDate = expense_date ? new Date(expense_date) : new Date();
+    const expenseDate = expenseDateForDb(expense_date) || new Date().toISOString().slice(0, 10);
     const paymentMethod = payment_method || 'cash';
 
     const result = await client.query(
       `INSERT INTO daily_expenses (expense_category, amount, expense_date, payment_method, notes, shop_id)
-       VALUES ($1, $2, $3, $4, $5, $6)
+       VALUES ($1, $2, $3::date, $4, $5, $6)
        RETURNING *`,
       [expense_category.trim(), expenseAmount, expenseDate, paymentMethod, notes || null, req.shopId]
     );
@@ -189,11 +227,11 @@ router.put('/:id', async (req, res) => {
       throw new Error('Amount must be greater than 0');
     }
 
-    const expenseDate = expense_date ? new Date(expense_date) : null;
+    const expenseDate = expenseDateForDb(expense_date);
 
     const result = await client.query(
       `UPDATE daily_expenses 
-       SET expense_category = $1, amount = $2, expense_date = COALESCE($3, expense_date), 
+       SET expense_category = $1, amount = $2, expense_date = COALESCE($3::date, expense_date), 
            payment_method = $4, notes = $5
        WHERE expense_id = $6 AND shop_id = $7
        RETURNING *`,

@@ -64,7 +64,19 @@ router.get('/', async (req, res) => {
         s.total_profit,
         s.is_finalized,
         s.finalized_at,
-        s.created_by
+        s.created_by,
+        (SELECT COUNT(*)::int FROM sale_items si0 WHERE si0.sale_id = s.sale_id) AS item_count,
+        (
+          SELECT string_agg(sub2.nm, ', ')
+          FROM (
+            SELECT COALESCE(p.item_name_english, p.name) AS nm
+            FROM sale_items si2
+            JOIN products p ON si2.product_id = p.product_id AND p.shop_id = s.shop_id
+            WHERE si2.sale_id = s.sale_id
+            ORDER BY si2.sale_item_id
+            LIMIT 5
+          ) sub2
+        ) AS items_preview
       FROM sales s
       LEFT JOIN customers c
         ON s.customer_id = c.customer_id
