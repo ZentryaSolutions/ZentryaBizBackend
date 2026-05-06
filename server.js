@@ -13,13 +13,48 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || '0.0.0.0'; // Listen on all network interfaces for LAN access
 
-// CORS: reflect request origin (works for dev proxy + same-origin production web)
-app.use(cors({
-  origin: true,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-device-id', 'x-session-id', 'x-shop-id'],
-}));
+/**
+ * Explicit preflight responses — some hosts/CDNs return 403 on OPTIONS if Allowed-Headers
+ * does not match Access-Control-Request-Headers exactly. Reflect the browser's requested list.
+ */
+function handleCorsPreflight(req, res, next) {
+  if (req.method !== 'OPTIONS') return next();
+  const origin = req.headers.origin;
+  if (!origin) return next();
+
+  const acrh = req.headers['access-control-request-headers'];
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    acrh ||
+      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, Accept, Accept-Language, X-Requested-With'
+  );
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  return res.sendStatus(204);
+}
+
+app.use(handleCorsPreflight);
+
+// CORS: reflect request origin (works for dev proxy + cross-origin SPA on Vercel)
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'x-device-id',
+      'x-session-id',
+      'x-shop-id',
+      'Accept',
+      'Accept-Language',
+      'X-Requested-With',
+    ],
+  })
+);
 
 // Stripe webhook needs raw body for signature verification (must be registered BEFORE express.json()).
 const stripeWebhookHandler = require('./routes/stripeWebhook');

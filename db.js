@@ -2,9 +2,16 @@
  * PostgreSQL via Supabase (or any Postgres). Set DATABASE_URL in backend/.env
  * or DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD.
  */
+const dns = require('dns');
 const { Pool } = require('pg');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+/** Optional: comma-separated DNS servers (e.g. 8.8.8.8,1.1.1.1) if `db.*.supabase.co` fails to resolve. */
+if (process.env.DB_DNS_SERVERS) {
+  const list = process.env.DB_DNS_SERVERS.split(',').map((s) => s.trim()).filter(Boolean);
+  if (list.length) dns.setServers(list);
+}
 
 function sslOption() {
   const url = process.env.DATABASE_URL || '';
@@ -163,6 +170,13 @@ const testConnection = async (maxRetries = 5, retryDelay = 2000) => {
     } catch (error) {
       if (attempt === maxRetries) {
         console.error(`❌ Database connection failed after ${maxRetries} attempts:`, error.message);
+        const msg = String(error.message || '');
+        const conn = process.env.DATABASE_URL || '';
+        if (/ENOTFOUND|getaddrinfo/i.test(msg) && conn.includes('.supabase.co')) {
+          console.error(
+            '[db] Supabase tip: Direct host db.<project>.supabase.co is IPv6-only. Windows often hits ENOTFOUND (no usable IPv6). Copy the URI from Dashboard → Connect → "Session pooler" (postgres.<ref>@aws-0-<region>.pooler.supabase.com:5432) into backend/env.local DATABASE_URL.'
+          );
+        }
         return false;
       }
       console.warn(
