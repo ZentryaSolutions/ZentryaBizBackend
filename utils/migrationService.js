@@ -7,8 +7,30 @@ const fs = require('fs').promises;
 const path = require('path');
 const db = require('../db');
 
-// Migration directory
-const MIGRATIONS_DIR = path.join(__dirname, '../../database/migrations');
+function resolveMigrationsDir() {
+  // Monorepo layout: <repo>/backend/utils → ../../database/migrations
+  const monorepoDir = path.join(__dirname, '..', '..', '..', 'database', 'migrations');
+  // Backend-only repo layout (subtree): <repo>/utils → ../database/migrations
+  const subtreeDir = path.join(__dirname, '..', 'database', 'migrations');
+
+  try {
+    // Prefer existing directories (avoid accidentally creating folders outside repo root)
+    const fsSync = require('fs');
+    if (fsSync.existsSync(monorepoDir)) return monorepoDir;
+    if (fsSync.existsSync(subtreeDir)) return subtreeDir;
+  } catch (_) {
+    /* ignore */
+  }
+  // Default to subtree layout (safe to create inside backend repo)
+  return subtreeDir;
+}
+
+// Migration directory (supports monorepo + backend-only repo)
+const MIGRATIONS_DIR = resolveMigrationsDir();
+
+function allowDestructiveMigrations() {
+  return String(process.env.ALLOW_DESTRUCTIVE_MIGRATIONS || '').trim().toLowerCase() === 'true';
+}
 
 // Schema version table name
 const SCHEMA_VERSION_TABLE = 'schema_version';
@@ -98,7 +120,8 @@ async function getRequiredSchemaVersion() {
     
     const files = await fs.readdir(MIGRATIONS_DIR);
     const migrationFiles = files
-      .filter(file => file.endsWith('.sql'))
+      .filter((file) => file.endsWith('.sql') || file.endsWith('.migration'))
+      .filter((file) => (allowDestructiveMigrations() ? true : !/wipe|truncate|destroy/i.test(file)))
       .map(file => {
         const match = file.match(/^(\d+)_/);
         return match ? parseInt(match[1]) : 0;
@@ -121,9 +144,10 @@ async function getMigrationFiles() {
     
     const files = await fs.readdir(MIGRATIONS_DIR);
     const migrationFiles = files
-      .filter(file => file.endsWith('.sql'))
+      .filter((file) => file.endsWith('.sql') || file.endsWith('.migration'))
+      .filter((file) => (allowDestructiveMigrations() ? true : !/wipe|truncate|destroy/i.test(file)))
       .map(file => {
-        const match = file.match(/^(\d+)_(.+)\.sql$/);
+        const match = file.match(/^(\d+)_(.+)\.(sql|migration)$/);
         if (match) {
           return {
             version: parseInt(match[1]),

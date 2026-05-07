@@ -1,0 +1,23 @@
+-- Zentrya / HisaabKitab: allow duplicate full names; only email must be unique for signup.
+--
+-- 1) Drop any UNIQUE constraint on zb_simple_users that mentions full_name (if present).
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    SELECT c.conname
+    FROM pg_constraint c
+    WHERE c.conrelid = 'public.zb_simple_users'::regclass
+      AND c.contype = 'u'
+      AND pg_get_constraintdef(c.oid) ILIKE '%full_name%'
+  LOOP
+    EXECUTE format('ALTER TABLE public.zb_simple_users DROP CONSTRAINT %I', r.conname);
+    RAISE NOTICE 'Dropped unique constraint: %', r.conname;
+  END LOOP;
+END $$;
+
+-- 2) Optional: ensure email is unique if you need it (uncomment after checking your schema)
+-- ALTER TABLE public.zb_simple_users
+--   ADD CONSTRAINT zb_simple_users_email_unique UNIQUE (email);
+
