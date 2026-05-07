@@ -856,9 +856,12 @@ router.post('/zb-simple-session', async (req, res) => {
           'PostgreSQL timed out or dropped the connection while creating your API session. Check DATABASE_URL, Supabase pooler (try port 5432 session mode if 6543 fails), VPN/firewall, or increase DB_CONNECTION_TIMEOUT_MS in backend/.env. Wait a few seconds and log in again.',
       });
     }
+    const debugEnabled = String(process.env.API_DEBUG_ERRORS || '').trim().toLowerCase() === 'true';
+    const debugMsg = debugEnabled ? (error?.message || String(error)) : null;
     res.status(500).json({
       error: 'Session failed',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Could not create API session',
+      message: process.env.NODE_ENV === 'development' ? error.message : debugMsg || 'Could not create API session',
+      ...(debugEnabled ? { detail: { code: error?.code, hint: error?.hint } } : {}),
     });
   }
 });
