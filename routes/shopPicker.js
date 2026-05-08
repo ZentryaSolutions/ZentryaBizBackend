@@ -1,6 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeShopUuidList(ids) {
+  return ids.map((x) => String(x).trim()).filter((id) => UUID_RE.test(id));
+}
 const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
 
@@ -18,24 +25,34 @@ router.use(requireAuth);
 router.post('/quick-stats', async (req, res) => {
   try {
     const raw = Array.isArray(req.body?.shopIds) ? req.body.shopIds : [];
-    const shopIds = raw
+    let shopIds = raw
       .map((x) => (x == null ? '' : String(x).trim()))
       .filter(Boolean)
       .slice(0, 50);
 
+    shopIds = normalizeShopUuidList(shopIds);
     if (shopIds.length === 0) {
       return res.json({ ok: true, stats: {} });
     }
 
-    // Only allow shops the current user is a member of
-    const allowedRes = await db.query(
-      `SELECT shop_id
-         FROM shop_users
-        WHERE user_id = $1
-          AND shop_id = ANY($2::text[])`,
-      [req.user.user_id, shopIds]
+    const uidRow = await db.query(
+      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+      [req.user.user_id]
     );
-    const allowed = new Set((allowedRes.rows || []).map((r) => String(r.shop_id)));
+    const profileId = uidRow.rows[0]?.zb_profile_id;
+    if (!profileId) {
+      return res.json({ ok: true, stats: {} });
+    }
+
+    // shop_users.user_id is the Supabase/Zentrya profile UUID, not users.user_id (integer)
+    const allowedRes = await db.query(
+      `SELECT shop_id::text AS shop_id
+         FROM shop_users
+        WHERE user_id = $1::uuid
+          AND shop_id = ANY($2::uuid[])`,
+      [profileId, shopIds]
+    );
+    const allowed = new Set((allowedRes.rows || []).map((r) => String(r.shop_id || '').trim()));
     const allowedIds = shopIds.filter((id) => allowed.has(String(id)));
 
     if (allowedIds.length === 0) {

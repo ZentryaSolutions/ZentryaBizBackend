@@ -140,7 +140,7 @@ async function resolveZbSimpleLogin(username, password) {
     };
   }
 
-  const u = String(uRaw).trim().toLowerCase();
+  const u = String(username).trim().toLowerCase();
   if (u.length < 2) {
     return { ok: false, status: 400, body: { error: 'Invalid username', message: 'Username too short' } };
   }
