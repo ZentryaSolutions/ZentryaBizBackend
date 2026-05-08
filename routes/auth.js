@@ -29,6 +29,7 @@ const deviceFingerprint = require('../utils/deviceFingerprint');
 const { validateEmailOtpMatch, markEmailOtpConsumed, normalizeEmail } = require('../utils/emailOtpVerify');
 const notificationsModule = require('./notifications');
 const createNotification = notificationsModule.createNotification || (async () => {});
+const { issueEmailOtp } = require('../utils/emailOtpIssue');
 
 function coercePlanForInsert(plan) {
   const s = plan == null || plan === '' ? 'trial' : String(plan).trim().toLowerCase();
@@ -109,6 +110,135 @@ async function getInviteByToken(token) {
     [token]
   );
   return r.rows[0] || null;
+}
+
+function maskEmailHint(emailRaw) {
+  const e = normalizeEmail(emailRaw);
+  const [u, d] = e.split('@');
+  if (!u || !d) return '';
+  const vis = u.length <= 2 ? `${u.slice(0, 1)}••` : `${u.slice(0, 2)}•••`;
+  return `${vis}@${d}`;
+}
+
+/**
+ * Verifies zb_simple_users password and returns linked `users` row (creating it if absent).
+ */
+async function resolveZbSimpleLogin(username, password) {
+  if (!username || !password) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Invalid credentials', message: 'Username and password are required' },
+    };
+  }
+
+  if (!db.isDatabaseConfigured()) {
+    return {
+      ok: false,
+      status: 503,
+      body: { error: 'Database not configured', message: 'Set DATABASE_URL in backend/.env' },
+    };
+  }
+
+  const u = String(uRaw).trim().toLowerCase();
+  if (u.length < 2) {
+    return { ok: false, status: 400, body: { error: 'Invalid username', message: 'Username too short' } };
+  }
+
+  let zbResult;
+  try {
+    zbResult = await db.query(
+      `SELECT id, full_name, username, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+       FROM zb_simple_users
+       WHERE (lower(trim(username)) = $1 OR lower(trim(coalesce(email, ''))) = $1)
+         AND password_hash = crypt($2::text, password_hash)`,
+      [u, password]
+    );
+  } catch (e) {
+    if (e.code === '42P01') {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: 'zb_simple_users missing',
+          message: 'Run database/zentrya_biz_simple_supabase_auth.sql in Supabase SQL',
+        },
+      };
+    }
+    if (e.code === '42703') {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: 'Email or MFA column missing',
+          message: 'Run database migrations (zb_simple_users email + mfa_email_enabled).',
+        },
+      };
+    }
+    if (e.message && e.message.includes('function crypt')) {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: 'pgcrypto required',
+          message: 'Enable extension pgcrypto in Postgres (Supabase: Database → Extensions)',
+        },
+      };
+    }
+    throw e;
+  }
+
+  if (zbResult.rows.length === 0) {
+    return {
+      ok: false,
+      status: 401,
+      body: {
+        error: 'Invalid credentials',
+        message: 'Zentrya username/password not found or incorrect',
+      },
+    };
+  }
+
+  const zb = zbResult.rows[0];
+  const lookupUserKey = String(zb.username).trim().toLowerCase();
+  let userResult = await db.query(
+    `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+    [lookupUserKey]
+  );
+
+  let user;
+  if (userResult.rows.length > 0) {
+    user = userResult.rows[0];
+    await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
+      zb.id,
+      user.user_id,
+    ]);
+  } else {
+    const displayName = (zb.full_name && String(zb.full_name).trim()) || zb.username || lookupUserKey;
+    const passwordHash = await hashPassword(password);
+    try {
+      const ins = await db.query(
+        `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+         VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+         RETURNING user_id, username, name, role`,
+        [displayName, lookupUserKey, passwordHash, zb.id]
+      );
+      user = ins.rows[0];
+    } catch (insErr) {
+      if (insErr.code === '23505') {
+        userResult = await db.query(
+          `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+          [lookupUserKey]
+        );
+        if (userResult.rows.length === 0) throw insErr;
+        user = userResult.rows[0];
+      } else {
+        throw insErr;
+      }
+    }
+  }
+
+  return { ok: true, zb, user };
 }
 
 async function attachExistingUserToInvitedShop(invite) {
@@ -726,100 +856,42 @@ router.post('/zb-simple-session', async (req, res) => {
     const ipAddress = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
 
-    if (!username || !password) {
-      return res.status(400).json({
-        error: 'Invalid credentials',
-        message: 'Username and password are required',
-      });
+    const resolved = await resolveZbSimpleLogin(username, password);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
     }
+    const { zb, user } = resolved;
 
-    if (!db.isDatabaseConfigured()) {
-      return res.status(503).json({
-        error: 'Database not configured',
-        message: 'Set DATABASE_URL in backend/.env',
-      });
-    }
-
-    const u = String(username).trim().toLowerCase();
-    if (u.length < 2) {
-      return res.status(400).json({ error: 'Invalid username', message: 'Username too short' });
-    }
-
-    let zbResult;
-    try {
-      zbResult = await db.query(
-        `SELECT id, full_name, username
-         FROM zb_simple_users
-         WHERE (lower(trim(username)) = $1 OR lower(trim(coalesce(email, ''))) = $1)
-           AND password_hash = crypt($2::text, password_hash)`,
-        [u, password]
-      );
-    } catch (e) {
-      if (e.code === '42P01') {
-        return res.status(503).json({
-          error: 'zb_simple_users missing',
-          message: 'Run database/zentrya_biz_simple_supabase_auth.sql in Supabase SQL',
+    if (zb.mfa_email_enabled) {
+      const em =
+        normalizeEmail(zb.email) ||
+        String(zb.username || '')
+          .trim()
+          .toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+        return res.status(409).json({
+          error: 'Two-factor is enabled but this account has no valid email on file.',
+          message: 'Ask an administrator to fix your account email, or restore access another way.',
         });
       }
-      if (e.code === '42703') {
-        return res.status(503).json({
-          error: 'Email column missing',
-          message: 'Run database/zentrya_biz_zb_simple_users_email.sql in Supabase (or omit email in login until migrated).',
-        });
-      }
-      if (e.message && e.message.includes('function crypt')) {
-        return res.status(503).json({
-          error: 'pgcrypto required',
-          message: 'Enable extension pgcrypto in Postgres (Supabase: Database → Extensions)',
-        });
-      }
-      throw e;
-    }
-
-    if (zbResult.rows.length === 0) {
-      return res.status(401).json({
-        error: 'Invalid credentials',
-        message: 'Zentrya username/password not found or incorrect',
-      });
-    }
-
-    const zb = zbResult.rows[0];
-    const lookupUserKey = String(zb.username).trim().toLowerCase();
-    let userResult = await db.query(
-      `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
-      [lookupUserKey]
-    );
-
-    let user;
-    if (userResult.rows.length > 0) {
-      user = userResult.rows[0];
-      await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
-        zb.id,
-        user.user_id,
-      ]);
-    } else {
-      const displayName = (zb.full_name && String(zb.full_name).trim()) || zb.username || lookupUserKey;
-      const passwordHash = await hashPassword(password);
       try {
-        const ins = await db.query(
-          `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
-           VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
-           RETURNING user_id, username, name, role`,
-          [displayName, lookupUserKey, passwordHash, zb.id]
-        );
-        user = ins.rows[0];
-      } catch (insErr) {
-        if (insErr.code === '23505') {
-          userResult = await db.query(
-            `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
-            [lookupUserKey]
-          );
-          if (userResult.rows.length === 0) throw insErr;
-          user = userResult.rows[0];
-        } else {
-          throw insErr;
+        await issueEmailOtp(req, em, 'login');
+      } catch (e) {
+        if (e.code === 'OTP_RATE_LIMIT') {
+          return res.status(429).json({ error: 'Too many requests. Try again later.' });
         }
+        console.error('[Auth Route] zb-simple-session MFA OTP:', e);
+        return res.status(500).json({
+          error: 'Failed to send login code',
+          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
+        });
       }
+
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        emailHint: maskEmailHint(em),
+      });
     }
 
     const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
@@ -863,6 +935,134 @@ router.post('/zb-simple-session', async (req, res) => {
       message: process.env.NODE_ENV === 'development' ? error.message : debugMsg || 'Could not create API session',
       ...(debugEnabled ? { detail: { code: error?.code, hint: error?.hint } } : {}),
     });
+  }
+});
+
+/**
+ * POST /api/auth/zb-simple-session/verify-otp
+ * Completes zb-simple-session after password + login OTP when mfa_email_enabled is true.
+ */
+router.post('/zb-simple-session/verify-otp', async (req, res) => {
+  try {
+    const { username, password, otp } = req.body || {};
+    const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
+    const ipAddress = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('user-agent');
+
+    const resolved = await resolveZbSimpleLogin(username, password);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
+    }
+
+    const { zb, user } = resolved;
+
+    if (!zb.mfa_email_enabled) {
+      return res.status(400).json({
+        error: 'Two-factor is not enabled.',
+        message: 'Use normal sign-in without a verification code.',
+      });
+    }
+
+    const em =
+      normalizeEmail(zb.email) ||
+      String(zb.username || '')
+        .trim()
+        .toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+      return res.status(400).json({ error: 'Invalid account email for OTP verification' });
+    }
+
+    const otpCode = String(otp || '').trim();
+    const otpCheck = await validateEmailOtpMatch(em, otpCode, 'login');
+    if (!otpCheck.ok) {
+      return res.status(400).json({ error: otpCheck.error || 'Invalid code' });
+    }
+    await markEmailOtpConsumed(otpCheck.rowId);
+
+    const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
+    await logLogin(user.user_id, ipAddress, userAgent, true);
+
+    res.json({
+      success: true,
+      sessionId,
+      user: {
+        user_id: user.user_id,
+        username: user.username,
+        name: user.name,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    console.error('[Auth Route] zb-simple-session/verify-otp error:', error);
+    res.status(500).json({
+      error: 'Session failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+});
+
+/**
+ * GET /api/auth/zb-email-mfa — current user's email OTP MFA toggle (zb_simple_users).
+ */
+router.get('/zb-email-mfa', requireAuth, async (req, res) => {
+  try {
+    if (!db.isDatabaseConfigured()) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+    const uidResult = await db.query(`SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`, [
+      req.user.user_id,
+    ]);
+    const profileId = uidResult.rows[0]?.zb_profile_id;
+    if (!profileId) {
+      return res.status(404).json({ error: 'Profile not linked', message: 'zb_profile_id missing on users row.' });
+    }
+
+    const zb = await db.query(
+      `SELECT mfa_email_enabled::boolean AS mfa_email_enabled, email FROM zb_simple_users WHERE id = $1::uuid LIMIT 1`,
+      [profileId]
+    );
+    if (!zb.rows.length) {
+      return res.status(404).json({ error: 'Zentrya profile not found' });
+    }
+    const row = zb.rows[0];
+    res.json({
+      success: true,
+      enabled: Boolean(row.mfa_email_enabled),
+      emailHint: row.email ? maskEmailHint(row.email) : '',
+    });
+  } catch (error) {
+    console.error('[Auth Route] zb-email-mfa GET:', error);
+    res.status(500).json({ error: 'Failed to load MFA setting' });
+  }
+});
+
+/**
+ * PUT /api/auth/zb-email-mfa — body: { enabled: boolean }
+ */
+router.put('/zb-email-mfa', requireAuth, async (req, res) => {
+  try {
+    if (!db.isDatabaseConfigured()) {
+      return res.status(503).json({ error: 'Database not configured' });
+    }
+    const enabled = Boolean(req.body?.enabled);
+
+    const uidResult = await db.query(`SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`, [
+      req.user.user_id,
+    ]);
+    const profileId = uidResult.rows[0]?.zb_profile_id;
+    if (!profileId) {
+      return res.status(404).json({ error: 'Profile not linked', message: 'zb_profile_id missing on users row.' });
+    }
+
+    await db.query(`UPDATE zb_simple_users SET mfa_email_enabled = $1 WHERE id = $2::uuid`, [
+      enabled,
+      profileId,
+    ]);
+
+    res.json({ success: true, enabled });
+  } catch (error) {
+    console.error('[Auth Route] zb-email-mfa PUT:', error);
+    res.status(500).json({ error: 'Failed to update MFA setting' });
   }
 });
 

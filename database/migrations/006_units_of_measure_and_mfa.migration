@@ -1,0 +1,22 @@
+-- 006: Units of Measure table + per-user email 2FA flag
+
+-- Units of Measure (per shop)
+CREATE TABLE IF NOT EXISTS units_of_measure (
+  unit_id BIGSERIAL PRIMARY KEY,
+  shop_id TEXT NOT NULL,
+  unit_code TEXT NOT NULL,
+  unit_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Uniqueness per shop (case-insensitive)
+CREATE UNIQUE INDEX IF NOT EXISTS units_of_measure_shop_code_uq
+  ON units_of_measure (shop_id, LOWER(unit_code));
+CREATE UNIQUE INDEX IF NOT EXISTS units_of_measure_shop_name_uq
+  ON units_of_measure (shop_id, LOWER(unit_name));
+
+-- Per-user 2FA toggle (email OTP) stored on zb_simple_users
+ALTER TABLE zb_simple_users
+  ADD COLUMN IF NOT EXISTS mfa_email_enabled BOOLEAN NOT NULL DEFAULT false;
+

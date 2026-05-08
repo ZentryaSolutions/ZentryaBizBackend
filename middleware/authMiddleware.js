@@ -9,6 +9,58 @@ const { verifyPassword, verifyPIN } = require('../utils/authUtils');
 const deviceFingerprint = require('../utils/deviceFingerprint');
 let sessionTableReadyPromise = null;
 
+function parseSecSessionTimeoutToMs(raw) {
+  const s = String(raw ?? '').trim();
+  if (/^never$/i.test(s)) return null;
+  if (!s) return 30 * 60 * 1000;
+  const lower = s.toLowerCase();
+  if (lower === '15 minutes') return 15 * 60 * 1000;
+  if (lower === '30 minutes') return 30 * 60 * 1000;
+  if (lower === '1 hour') return 60 * 60 * 1000;
+  if (lower === '4 hours') return 4 * 60 * 60 * 1000;
+  const mMin = /^(\d+)\s*minutes?$/i.exec(s);
+  if (mMin) return Number(mMin[1]) * 60 * 1000;
+  const mHr = /^(\d+)\s*hours?$/i.exec(s);
+  if (mHr) return Number(mHr[1]) * 60 * 60 * 1000;
+  const n = Number(s);
+  if (Number.isFinite(n) && n > 0) return n * 60 * 1000;
+  return 30 * 60 * 1000;
+}
+
+async function getEffectiveIdleMsForRequest(req) {
+  if (!req || !db.isDatabaseConfigured()) return null;
+  const sid = req.headers['x-shop-id'] != null ? String(req.headers['x-shop-id']).trim() : '';
+  if (sid) {
+    try {
+      const r = await db.query(
+        `SELECT other_app_settings FROM settings WHERE shop_id::text = $1 ORDER BY id LIMIT 1`,
+        [sid]
+      );
+      if (r.rows.length) {
+        let o = r.rows[0].other_app_settings;
+        if (typeof o === 'string') {
+          try {
+            o = JSON.parse(o);
+          } catch {
+            o = {};
+          }
+        }
+        const sec = o && typeof o === 'object' ? o.sec_session_timeout : null;
+        return parseSecSessionTimeoutToMs(sec);
+      }
+    } catch (e) {
+      if (e.code !== '42P01') {
+        console.warn('[getEffectiveIdleMsForRequest]', e.message);
+      }
+    }
+  }
+  const envM = String(process.env.SESSION_IDLE_TIMEOUT_MINUTES || '30').trim().toLowerCase();
+  if (!envM || envM === 'never' || envM === '0') return null;
+  const n = Number(envM);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n * 60 * 1000;
+}
+
 async function ensureUserSessionsTable() {
   if (sessionTableReadyPromise) return sessionTableReadyPromise;
   sessionTableReadyPromise = (async () => {
@@ -49,8 +101,8 @@ async function requireAuth(req, res, next) {
       });
     }
 
-    // Verify session
-    const session = await verifySession(sessionId);
+    // Verify session (optional idle timeout when x-shop-id or SESSION_IDLE_TIMEOUT_MINUTES applies)
+    const session = await verifySession(sessionId, req);
     
     if (!session || !session.isValid) {
       return res.status(401).json({
@@ -181,7 +233,7 @@ async function requireAdministratorOrProfileOwner(req, res, next) {
  * @param {string} sessionId - Session ID
  * @returns {Promise<Object|null>} - Session info with user data or null
  */
-async function verifySession(sessionId) {
+async function verifySession(sessionId, req = null) {
   try {
     if (!db.isDatabaseConfigured()) {
       return mockSessions.getMockSession(sessionId);
@@ -211,8 +263,23 @@ async function verifySession(sessionId) {
     }
 
     const row = result.rows[0];
-    
-    // Update last activity
+
+    let idleMs = null;
+    if (req) {
+      try {
+        idleMs = await getEffectiveIdleMsForRequest(req);
+      } catch (e) {
+        console.warn('[verifySession] idle policy:', e.message);
+      }
+    }
+    if (idleMs != null && row.last_activity) {
+      const last = new Date(row.last_activity).getTime();
+      if (Number.isFinite(last) && Date.now() - last > idleMs) {
+        await db.query(`DELETE FROM user_sessions WHERE session_id = $1`, [sessionId]);
+        return null;
+      }
+    }
+
     await db.query(`
       UPDATE user_sessions 
       SET last_activity = NOW() 

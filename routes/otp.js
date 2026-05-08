@@ -1,58 +1,10 @@
 const express = require('express');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 
 const db = require('../db');
-const msGraphMail = require('../utils/msGraphMail');
-const { buildOtpEmailContent } = require('../utils/otpEmailContent');
+const { issueEmailOtp } = require('../utils/emailOtpIssue');
 const { verifyAndConsumeEmailOtp, normalizeEmail } = require('../utils/emailOtpVerify');
 
 const router = express.Router();
-
-function genOtp6() {
-  const n = crypto.randomInt(0, 1000000);
-  return String(n).padStart(6, '0');
-}
-
-function sha256(text) {
-  return crypto.createHash('sha256').update(text).digest('hex');
-}
-
-function mustGetEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
-
-function buildTransport() {
-  const host = mustGetEnv('SMTP_HOST');
-  const port = Number(mustGetEnv('SMTP_PORT'));
-  const user = mustGetEnv('SMTP_USER');
-  const pass = mustGetEnv('SMTP_PASS');
-  const secure = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465;
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-  });
-}
-
-async function sendOtpEmail({ to, code, purpose }) {
-  const { subject, text, html } = buildOtpEmailContent(code, purpose);
-
-  if (msGraphMail.isConfigured()) {
-    await msGraphMail.sendMail({ to, subject, text, html });
-    return;
-  }
-
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  if (!from) throw new Error('Missing env: SMTP_FROM (or SMTP_USER), or configure MS Graph (MS_GRAPH_*)');
-
-  const transport = buildTransport();
-  await transport.sendMail({ from, to, subject, text, html });
-}
 
 // POST /api/otp/request
 // body: { email, purpose?: 'signup'|'login'|'reset' }
@@ -83,12 +35,25 @@ router.post('/request', async (req, res) => {
         }
       }
       if (purpose === 'login') {
-        const found = await db.query(
-          `SELECT 1 FROM public.zb_simple_users WHERE lower(trim(coalesce(email,''))) = $1 LIMIT 1`,
-          [email]
-        );
-        if (found.rows.length === 0) {
-          return res.status(400).json({ error: 'No account for this email' });
+        try {
+          const found = await db.query(
+            `SELECT COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+             FROM public.zb_simple_users WHERE lower(trim(coalesce(email,''))) = $1 LIMIT 1`,
+            [email]
+          );
+          if (found.rows.length === 0) {
+            return res.status(400).json({ error: 'No account for this email' });
+          }
+          if (!found.rows[0].mfa_email_enabled) {
+            return res.status(400).json({
+              error: 'Two-factor email is not enabled for this account. Enable it under Settings → Security after signing in.',
+            });
+          }
+        } catch (e) {
+          if (e.code === '42703') {
+            return res.status(503).json({ error: 'Database migration required', message: 'mfa_email_enabled column missing.' });
+          }
+          throw e;
         }
       }
       if (purpose === 'reset') {
@@ -110,31 +75,14 @@ router.post('/request', async (req, res) => {
       throw e;
     }
 
-    const rl = await db.query(
-      `SELECT COUNT(*)::int AS c
-       FROM public.email_otps
-       WHERE email=$1 AND created_at > (NOW() - INTERVAL '15 minutes')`,
-      [email]
-    );
-    if ((rl.rows?.[0]?.c || 0) >= 3) {
-      return res.status(429).json({ error: 'Too many requests. Try again later.' });
+    try {
+      await issueEmailOtp(req, email, purpose);
+    } catch (e) {
+      if (e.code === 'OTP_RATE_LIMIT') {
+        return res.status(429).json({ error: 'Too many requests. Try again later.' });
+      }
+      throw e;
     }
-
-    const code = genOtp6();
-    const salt = crypto.randomBytes(16).toString('hex');
-    const codeHash = sha256(`${salt}:${code}`);
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-
-    const ipAddress = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString();
-    const userAgent = String(req.headers['user-agent'] || '');
-
-    await db.query(
-      `INSERT INTO public.email_otps (email, purpose, code_hash, salt, expires_at, ip_address, user_agent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [email, purpose, codeHash, salt, expiresAt.toISOString(), ipAddress, userAgent]
-    );
-
-    await sendOtpEmail({ to: email, code, purpose });
 
     return res.json({ success: true });
   } catch (e) {
