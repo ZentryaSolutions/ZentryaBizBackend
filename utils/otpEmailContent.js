@@ -5,6 +5,7 @@ function buildOtpEmailContent(code, purpose) {
   if (purpose === 'signup') safePurpose = 'complete your signup';
   else if (purpose === 'reset') safePurpose = 'reset your password';
   else if (purpose === 'login') safePurpose = 'sign in to your account';
+  else if (purpose === 'new_device') safePurpose = 'verify this browser or device';
 
   const text =
     `Your ${appName} verification code is: ${code}\n\n` +

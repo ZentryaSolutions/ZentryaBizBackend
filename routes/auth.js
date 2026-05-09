@@ -21,6 +21,7 @@ const {
 const { 
   createSession, 
   destroySession, 
+  destroyAllUserSessions,
   requireAuth, 
   requireRole 
 } = require('../middleware/authMiddleware');
@@ -30,6 +31,9 @@ const { validateEmailOtpMatch, markEmailOtpConsumed, normalizeEmail } = require(
 const notificationsModule = require('./notifications');
 const createNotification = notificationsModule.createNotification || (async () => {});
 const { issueEmailOtp } = require('../utils/emailOtpIssue');
+const { isDeviceTrusted, addTrustedDevice } = require('../utils/trustedDevices');
+const { consumeLogoutAllToken } = require('../utils/emailSecurityTokens');
+const { sendLoginAlertEmail, getFrontendBaseUrl } = require('../utils/loginAlertEmail');
 
 function coercePlanForInsert(plan) {
   const s = plan == null || plan === '' ? 'trial' : String(plan).trim().toLowerCase();
@@ -118,6 +122,26 @@ function maskEmailHint(emailRaw) {
   if (!u || !d) return '';
   const vis = u.length <= 2 ? `${u.slice(0, 1)}••` : `${u.slice(0, 2)}•••`;
   return `${vis}@${d}`;
+}
+
+/** After password (+ optional OTP), create session, trust device, audit log, login alert email. */
+async function finalizeZbSimpleAuthSession(req, { user, zb, deviceId, ipAddress, userAgent }) {
+  await addTrustedDevice(user.user_id, deviceId);
+  const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
+  await logLogin(user.user_id, ipAddress, userAgent, true);
+  const em =
+    normalizeEmail(zb.email) ||
+    String(zb.username || '')
+      .trim()
+      .toLowerCase();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+    await sendLoginAlertEmail(req, {
+      to: em,
+      displayName: user.name,
+      userId: user.user_id,
+    });
+  }
+  return sessionId;
 }
 
 /**
@@ -890,12 +914,52 @@ router.post('/zb-simple-session', async (req, res) => {
       return res.json({
         success: true,
         requiresOtp: true,
+        otpKind: 'mfa',
         emailHint: maskEmailHint(em),
       });
     }
 
-    const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
-    await logLogin(user.user_id, ipAddress, userAgent, true);
+    const zbEmail =
+      normalizeEmail(zb.email) ||
+      String(zb.username || '')
+        .trim()
+        .toLowerCase();
+    const trusted = await isDeviceTrusted(user.user_id, deviceId);
+    if (!trusted) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(zbEmail)) {
+        return res.status(409).json({
+          error: 'Security check requires a valid email on your account.',
+          message:
+            'This browser is not recognized. A verification code is sent by email — add a valid email to your account or contact support.',
+        });
+      }
+      try {
+        await issueEmailOtp(req, zbEmail, 'new_device');
+      } catch (e) {
+        if (e.code === 'OTP_RATE_LIMIT') {
+          return res.status(429).json({ error: 'Too many requests. Try again later.' });
+        }
+        console.error('[Auth Route] zb-simple-session new_device OTP:', e);
+        return res.status(500).json({
+          error: 'Failed to send security code',
+          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
+        });
+      }
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        otpKind: 'new_device',
+        emailHint: maskEmailHint(zbEmail),
+      });
+    }
+
+    const sessionId = await finalizeZbSimpleAuthSession(req, {
+      user,
+      zb,
+      deviceId,
+      ipAddress,
+      userAgent,
+    });
 
     res.json({
       success: true,
@@ -944,7 +1008,7 @@ router.post('/zb-simple-session', async (req, res) => {
  */
 router.post('/zb-simple-session/verify-otp', async (req, res) => {
   try {
-    const { username, password, otp } = req.body || {};
+    const { username, password, otp, otpKind } = req.body || {};
     const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
     const ipAddress = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
@@ -956,13 +1020,6 @@ router.post('/zb-simple-session/verify-otp', async (req, res) => {
 
     const { zb, user } = resolved;
 
-    if (!zb.mfa_email_enabled) {
-      return res.status(400).json({
-        error: 'Two-factor is not enabled.',
-        message: 'Use normal sign-in without a verification code.',
-      });
-    }
-
     const em =
       normalizeEmail(zb.email) ||
       String(zb.username || '')
@@ -972,15 +1029,36 @@ router.post('/zb-simple-session/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Invalid account email for OTP verification' });
     }
 
+    const otpKindNorm = String(otpKind || '')
+      .trim()
+      .toLowerCase();
+    let purpose;
+    if (zb.mfa_email_enabled) {
+      purpose = 'login';
+    } else if (otpKindNorm === 'new_device') {
+      purpose = 'new_device';
+    } else {
+      return res.status(400).json({
+        error: 'Invalid verification request',
+        message:
+          'Use the security code sent when signing in from a new browser, or sign in without a code from a trusted device.',
+      });
+    }
+
     const otpCode = String(otp || '').trim();
-    const otpCheck = await validateEmailOtpMatch(em, otpCode, 'login');
+    const otpCheck = await validateEmailOtpMatch(em, otpCode, purpose);
     if (!otpCheck.ok) {
       return res.status(400).json({ error: otpCheck.error || 'Invalid code' });
     }
     await markEmailOtpConsumed(otpCheck.rowId);
 
-    const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
-    await logLogin(user.user_id, ipAddress, userAgent, true);
+    const sessionId = await finalizeZbSimpleAuthSession(req, {
+      user,
+      zb,
+      deviceId,
+      ipAddress,
+      userAgent,
+    });
 
     res.json({
       success: true,
@@ -998,6 +1076,32 @@ router.post('/zb-simple-session/verify-otp', async (req, res) => {
       error: 'Session failed',
       message: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
+  }
+});
+
+/**
+ * GET /api/auth/email-revoke-sessions?token=...
+ * One-time link from login alert email — invalidates all API sessions for the account.
+ */
+router.get('/email-revoke-sessions', async (req, res) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    const r = await consumeLogoutAllToken(token);
+    if (!r.ok) {
+      return res.status(400).send(String(r.error || 'Invalid or expired link'));
+    }
+    await destroyAllUserSessions(r.userId);
+    const fe = getFrontendBaseUrl();
+    if (fe) {
+      return res.redirect(302, `${fe}/login?revoked=1`);
+    }
+    return res.type('html').send(
+      '<!doctype html><html><head><meta charset="utf-8"><title>Signed out</title></head><body style="font-family:system-ui;padding:24px">' +
+        '<p>All sessions for this account have been signed out. You can close this window.</p></body></html>'
+    );
+  } catch (error) {
+    console.error('[Auth Route] email-revoke-sessions:', error);
+    res.status(500).send('Could not complete request');
   }
 });
 
