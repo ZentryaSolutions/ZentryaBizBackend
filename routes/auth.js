@@ -4,6 +4,7 @@
  */
 
 const express = require('express');
+const { jwtVerify } = require('jose');
 const router = express.Router();
 const db = require('../db');
 const { 
@@ -263,6 +264,129 @@ async function resolveZbSimpleLogin(username, password) {
   }
 
   return { ok: true, zb, user };
+}
+
+/**
+ * Email verified via Supabase OAuth JWT (Google). Same account rows as password login, no password check.
+ */
+async function resolveZbSimpleByVerifiedEmail(emailNorm) {
+  if (!emailNorm || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'Invalid email', message: 'Valid email is required for Google sign-in' },
+    };
+  }
+  if (!db.isDatabaseConfigured()) {
+    return {
+      ok: false,
+      status: 503,
+      body: { error: 'Database not configured', message: 'Set DATABASE_URL in backend/.env' },
+    };
+  }
+
+  let zbResult;
+  try {
+    zbResult = await db.query(
+      `SELECT id, full_name, username, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+       FROM zb_simple_users
+       WHERE lower(trim(coalesce(email, ''))) = $1 OR lower(trim(username)) = $1`,
+      [emailNorm]
+    );
+  } catch (e) {
+    if (e.code === '42P01') {
+      return {
+        ok: false,
+        status: 503,
+        body: {
+          error: 'zb_simple_users missing',
+          message: 'Run database/zentrya_biz_simple_supabase_auth.sql in Supabase SQL',
+        },
+      };
+    }
+    throw e;
+  }
+
+  if (zbResult.rows.length === 0) {
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: 'No Zentrya account',
+        message:
+          'No account exists for this Google email. Sign up with the same email first, then you can use Google sign-in.',
+      },
+    };
+  }
+
+  const zb = zbResult.rows[0];
+  const lookupUserKey = String(zb.username).trim().toLowerCase();
+  let userResult = await db.query(
+    `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+    [lookupUserKey]
+  );
+
+  let user;
+  if (userResult.rows.length > 0) {
+    user = userResult.rows[0];
+    await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
+      zb.id,
+      user.user_id,
+    ]);
+  } else {
+    const displayName = (zb.full_name && String(zb.full_name).trim()) || zb.username || lookupUserKey;
+    const passwordHash = await hashPassword(`oauth|${zb.id}|${Date.now()}`);
+    try {
+      const ins = await db.query(
+        `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+         VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+         RETURNING user_id, username, name, role`,
+        [displayName, lookupUserKey, passwordHash, zb.id]
+      );
+      user = ins.rows[0];
+    } catch (insErr) {
+      if (insErr.code === '23505') {
+        userResult = await db.query(
+          `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+          [lookupUserKey]
+        );
+        if (userResult.rows.length === 0) throw insErr;
+        user = userResult.rows[0];
+      } else {
+        throw insErr;
+      }
+    }
+  }
+
+  return { ok: true, zb, user };
+}
+
+async function verifySupabaseAccessTokenEmail(accessToken) {
+  const secret = process.env.SUPABASE_JWT_SECRET;
+  if (!secret || !String(secret).trim()) {
+    const err = new Error('Google sign-in is not configured on the server (missing SUPABASE_JWT_SECRET).');
+    err.code = 'NO_JWT_SECRET';
+    throw err;
+  }
+  let payload;
+  try {
+    const r = await jwtVerify(accessToken, new TextEncoder().encode(String(secret).trim()), {
+      algorithms: ['HS256'],
+    });
+    payload = r.payload;
+  } catch (e) {
+    const err = new Error('Invalid or expired sign-in session');
+    err.code = 'JWT_INVALID';
+    err.cause = e;
+    throw err;
+  }
+  const email = payload.email;
+  if (!email || typeof email !== 'string') {
+    const err = new Error('Google did not return an email for this account');
+    err.code = 'NO_EMAIL';
+    throw err;
+  }
+  return normalizeEmail(email);
 }
 
 async function attachExistingUserToInvitedShop(invite) {
@@ -1003,17 +1127,208 @@ router.post('/zb-simple-session', async (req, res) => {
 });
 
 /**
- * POST /api/auth/zb-simple-session/verify-otp
- * Completes zb-simple-session after password + login OTP when mfa_email_enabled is true.
+ * POST /api/auth/zb-simple-session-oauth
+ * Google (or other Supabase OAuth): verify browser access_token, match zb_simple_users by email, return POS session.
  */
-router.post('/zb-simple-session/verify-otp', async (req, res) => {
+router.post('/zb-simple-session-oauth', async (req, res) => {
   try {
-    const { username, password, otp, otpKind } = req.body || {};
+    const authHeader = req.headers.authorization;
+    let accessToken = req.body?.access_token || req.body?.accessToken;
+    if (!accessToken && authHeader && String(authHeader).startsWith('Bearer ')) {
+      accessToken = String(authHeader).slice(7).trim();
+    }
+    if (!accessToken) {
+      return res.status(400).json({
+        error: 'access_token required',
+        message: 'Provide the Supabase session access token in JSON body or Authorization: Bearer.',
+      });
+    }
+
+    let emailNorm;
+    try {
+      emailNorm = await verifySupabaseAccessTokenEmail(String(accessToken).trim());
+    } catch (e) {
+      if (e.code === 'NO_JWT_SECRET') {
+        return res.status(503).json({
+          error: 'Google sign-in not configured',
+          message: e.message,
+        });
+      }
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: e.message || 'Invalid or expired token',
+      });
+    }
+
+    const resolved = await resolveZbSimpleByVerifiedEmail(emailNorm);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
+    }
+    const { zb, user } = resolved;
+
     const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
     const ipAddress = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
 
-    const resolved = await resolveZbSimpleLogin(username, password);
+    if (zb.mfa_email_enabled) {
+      const em =
+        normalizeEmail(zb.email) ||
+        String(zb.username || '')
+          .trim()
+          .toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+        return res.status(409).json({
+          error: 'Two-factor is enabled but this account has no valid email on file.',
+          message: 'Ask an administrator to fix your account email, or restore access another way.',
+        });
+      }
+      try {
+        await issueEmailOtp(req, em, 'login');
+      } catch (e) {
+        if (e.code === 'OTP_RATE_LIMIT') {
+          return res.status(429).json({ error: 'Too many requests. Try again later.' });
+        }
+        console.error('[Auth Route] zb-simple-session-oauth MFA OTP:', e);
+        return res.status(500).json({
+          error: 'Failed to send login code',
+          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
+        });
+      }
+
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        otpKind: 'mfa',
+        emailHint: maskEmailHint(em),
+        zb_profile_id: zb.id,
+        zb_username: zb.username,
+        zb_full_name: zb.full_name,
+        zb_email: em,
+      });
+    }
+
+    const zbEmail =
+      normalizeEmail(zb.email) ||
+      String(zb.username || '')
+        .trim()
+        .toLowerCase();
+    const trusted = await isDeviceTrusted(user.user_id, deviceId);
+    if (!trusted) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(zbEmail)) {
+        return res.status(409).json({
+          error: 'Security check requires a valid email on your account.',
+          message:
+            'This browser is not recognized. A verification code is sent by email — add a valid email to your account or contact support.',
+        });
+      }
+      try {
+        await issueEmailOtp(req, zbEmail, 'new_device');
+      } catch (e) {
+        if (e.code === 'OTP_RATE_LIMIT') {
+          return res.status(429).json({ error: 'Too many requests. Try again later.' });
+        }
+        console.error('[Auth Route] zb-simple-session-oauth new_device OTP:', e);
+        return res.status(500).json({
+          error: 'Failed to send security code',
+          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
+        });
+      }
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        otpKind: 'new_device',
+        emailHint: maskEmailHint(zbEmail),
+        zb_profile_id: zb.id,
+        zb_username: zb.username,
+        zb_full_name: zb.full_name,
+        zb_email: zbEmail,
+      });
+    }
+
+    const sessionId = await finalizeZbSimpleAuthSession(req, {
+      user,
+      zb,
+      deviceId,
+      ipAddress,
+      userAgent,
+    });
+
+    res.json({
+      success: true,
+      sessionId,
+      user: {
+        user_id: user.user_id,
+        username: user.username,
+        name: user.name,
+        role: user.role,
+      },
+      zb_profile_id: zb.id,
+      zb_username: zb.username,
+      zb_full_name: zb.full_name,
+      zb_email: zbEmail,
+    });
+  } catch (error) {
+    console.error('[Auth Route] zb-simple-session-oauth error:', error);
+    const debugEnabled = String(process.env.API_DEBUG_ERRORS || '').trim().toLowerCase() === 'true';
+    const debugMsg = debugEnabled ? (error?.message || String(error)) : null;
+    res.status(500).json({
+      error: 'Session failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : debugMsg || 'Could not create API session',
+      ...(debugEnabled ? { detail: { code: error?.code, hint: error?.hint } } : {}),
+    });
+  }
+});
+
+/**
+ * POST /api/auth/zb-simple-session/verify-otp
+ * Completes zb-simple-session after password + login OTP when mfa_email_enabled is true.
+ * Or: Google OAuth — pass access_token instead of password (same OTP rules).
+ */
+router.post('/zb-simple-session/verify-otp', async (req, res) => {
+  try {
+    const { username, password, otp, otpKind, access_token, accessToken } = req.body || {};
+    const rawToken = access_token || accessToken;
+    const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
+    const ipAddress = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('user-agent');
+
+    let resolved;
+    if (rawToken) {
+      let emailFromJwt;
+      try {
+        emailFromJwt = await verifySupabaseAccessTokenEmail(String(rawToken).trim());
+      } catch (e) {
+        if (e.code === 'NO_JWT_SECRET') {
+          return res.status(503).json({
+            error: 'Google sign-in not configured',
+            message: e.message,
+          });
+        }
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: e.message || 'Invalid or expired token',
+        });
+      }
+      const u = String(username || '').trim().toLowerCase();
+      if (!u) {
+        return res.status(400).json({ error: 'username is required' });
+      }
+      if (normalizeEmail(emailFromJwt) !== normalizeEmail(u)) {
+        return res.status(400).json({
+          error: 'Email mismatch',
+          message: 'The Google session email does not match the account you are verifying.',
+        });
+      }
+      resolved = await resolveZbSimpleByVerifiedEmail(normalizeEmail(emailFromJwt));
+    } else {
+      if (!password) {
+        return res.status(400).json({
+          error: 'password required',
+          message: 'Password is required unless signing in with Google (include access_token).',
+        });
+      }
+      resolved = await resolveZbSimpleLogin(username, password);
+    }
     if (!resolved.ok) {
       return res.status(resolved.status).json(resolved.body);
     }
