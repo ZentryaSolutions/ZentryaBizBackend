@@ -319,8 +319,11 @@ async function createSession(userId, deviceId, ipAddress, userAgent) {
 
   const { v4: uuidv4 } = require('uuid');
   const sessionId = uuidv4();
-  const expiresAt = new Date();
-  expiresAt.setHours(expiresAt.getHours() + 24); // 24 hour session
+  const maxDays = Math.min(
+    30,
+    Math.max(1, Number(process.env.SESSION_MAX_DAYS || 4) || 4)
+  );
+  const expiresAt = new Date(Date.now() + maxDays * 24 * 60 * 60 * 1000);
 
   await db.query(`
     INSERT INTO user_sessions (
