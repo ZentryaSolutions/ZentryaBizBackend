@@ -259,9 +259,15 @@ if (fs.existsSync(indexHtmlPath)) {
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ 
+  const origin = req.headers?.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
+  res.status(500).json({
     error: 'Something went wrong!',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined,
   });
 });
 
@@ -277,4 +283,35 @@ if (require.main === module) {
   });
 }
 
-module.exports = app;
+/**
+ * Vercel invokes this export directly. OPTIONS preflight must succeed with CORS headers
+ * even when the rest of the stack is slow or mis-ordered — browsers show "No
+ * Access-Control-Allow-Origin" if the preflight response omits them.
+ */
+function applyCorsPreflightHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return;
+  const acrh = req.headers['access-control-request-headers'];
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    acrh ||
+      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, Accept, Accept-Language, X-Requested-With'
+  );
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.setHeader('Vary', 'Origin');
+}
+
+function vercelServerlessHandler(req, res) {
+  if (req.method === 'OPTIONS' && req.headers.origin) {
+    applyCorsPreflightHeaders(req, res);
+    return res.status(204).end();
+  }
+  return app(req, res);
+}
+
+/** Vercel sets VERCEL=1 and VERCEL_ENV (production | preview | development). */
+const isVercelRuntime = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+module.exports = isVercelRuntime ? vercelServerlessHandler : app;
