@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Stripe = require('stripe');
 const db = require('../db');
+const { syncSubscriptionForUserId } = require('../utils/stripePlanSync');
 
 function getStripe() {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -118,6 +119,29 @@ router.post('/create-portal-session', async (req, res) => {
   } catch (e) {
     console.error('[Billing] create-portal-session error:', e);
     return res.status(500).json({ error: e.message || 'Failed to create portal session' });
+  }
+});
+
+/**
+ * After Stripe Checkout success — sync subscription to profiles (webhook fallback).
+ * Body: { userId } — public.profiles.id / Supabase auth user id
+ */
+router.post('/sync-subscription', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const sendEmail = req.body?.sendEmail !== false;
+    const result = await syncSubscriptionForUserId(userId, { sendEmail });
+    return res.json(result);
+  } catch (e) {
+    const status = e.status || 500;
+    console.error('[Billing] sync-subscription error:', e);
+    return res.status(status).json({
+      error: e.message || 'Failed to sync subscription',
+    });
   }
 });
 
