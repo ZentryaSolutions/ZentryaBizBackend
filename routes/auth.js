@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const { shopLimitForPlan } = require('../lib/planShopLimits');
 const { 
   hashPassword, 
   verifyPassword, 
@@ -82,6 +83,16 @@ async function insertProfileWithFallbacks(client, { zbId, displayName, userRole,
   }
   if (!inserted) throw lastErr || new Error('Could not insert profiles row');
   await client.query('RELEASE SAVEPOINT sp_profiles');
+
+  const shopLimit = shopLimitForPlan(planStr);
+  try {
+    await client.query(
+      `UPDATE public.profiles SET shop_limit = $2 WHERE id = $1::uuid`,
+      [zbId, shopLimit]
+    );
+  } catch (e) {
+    if (!/shop_limit/i.test(String(e.message || ''))) throw e;
+  }
 }
 
 async function ensureStaffInvitationsTable() {

@@ -16,7 +16,7 @@ function getStripe() {
 /**
  * Create Stripe Checkout Session for subscription.
  * Frontend passes:
- *  - priceId (Starter/Pro/Premium price ID)
+ *  - priceId (Growth/Pro or Business/Premium Stripe price ID)
  *  - successUrl, cancelUrl
  *  - customerEmail (optional; Stripe can create customer)
  *

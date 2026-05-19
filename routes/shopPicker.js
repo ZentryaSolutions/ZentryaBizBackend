@@ -10,6 +10,7 @@ function normalizeShopUuidList(ids) {
 }
 const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
+const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimits');
 
 /**
  * Shop picker quick stats (multi-shop).
@@ -98,6 +99,125 @@ router.post('/quick-stats', async (req, res) => {
     return res.json({ ok: true, stats: byShop });
   } catch (e) {
     return res.status(500).json({ ok: false, error: 'quick-stats failed' });
+  }
+});
+
+/**
+ * Create shop (owner) with plan shop_limit enforced server-side.
+ * Body: { name, phone, address?, business_type?, city?, currency? }
+ */
+router.post('/create-shop', async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const phone = String(req.body?.phone || '').trim();
+    const phoneDigits = phone.replace(/\D/g, '');
+    if (!name) return res.status(400).json({ error: 'Shop name is required' });
+    if (!phone || phoneDigits.length < 10) {
+      return res.status(400).json({ error: 'Enter a valid mobile number (at least 10 digits).' });
+    }
+
+    const uidRow = await db.query(
+      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+      [req.user.user_id]
+    );
+    const profileId = uidRow.rows[0]?.zb_profile_id;
+    if (!profileId) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    let prof;
+    try {
+      prof = await db.query(
+        `SELECT plan::text AS plan, shop_limit FROM public.profiles WHERE id = $1::uuid LIMIT 1`,
+        [profileId]
+      );
+    } catch (colErr) {
+      prof = await db.query(
+        `SELECT plan::text AS plan FROM public.profiles WHERE id = $1::uuid LIMIT 1`,
+        [profileId]
+      );
+    }
+    if (!prof.rows.length) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    const planRow = prof.rows[0];
+    const limit = resolveShopLimit(planRow);
+    if (limit <= 0) {
+      return res.status(403).json({
+        error: 'Subscription expired',
+        message: 'Renew your plan to create shops.',
+        upgrade: true,
+      });
+    }
+
+    if (!isUnlimitedShopLimit(limit)) {
+      const countRes = await db.query(
+        `SELECT COUNT(*)::int AS c FROM public.shops WHERE owner_id = $1::uuid`,
+        [profileId]
+      );
+      const used = Number(countRes.rows[0]?.c) || 0;
+      if (used >= limit) {
+        return res.status(403).json({
+          error: 'Shop limit reached',
+          message: `Your plan allows ${limit} shop${limit === 1 ? '' : 's'}. Upgrade to add more.`,
+          shopLimit: limit,
+          shopsUsed: used,
+          upgrade: true,
+        });
+      }
+    }
+
+    const address = req.body?.address != null ? String(req.body.address).trim() || null : null;
+    const businessType = String(req.body?.business_type || 'General').trim() || 'General';
+    const city = req.body?.city != null ? String(req.body.city).trim() || null : null;
+    const currency = String(req.body?.currency || 'PKR').trim() || 'PKR';
+
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+      const shopRes = await client.query(
+        `INSERT INTO public.shops (owner_id, name, phone, address, business_type, city, currency)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+         RETURNING id::text AS id`,
+        [profileId, name, phone, address, businessType, city, currency]
+      );
+      const shopId = shopRes.rows[0]?.id;
+      if (!shopId) throw new Error('Shop insert failed');
+
+      const shopRoleCandidates = ['owner', 'admin', 'administrator'];
+      let linked = false;
+      for (const roleTry of shopRoleCandidates) {
+        try {
+          await client.query(
+            `INSERT INTO public.shop_users (shop_id, user_id, role)
+             VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
+            [shopId, profileId, roleTry]
+          );
+          linked = true;
+          break;
+        } catch (e) {
+          if (e.code === '23505') {
+            linked = true;
+            break;
+          }
+        }
+      }
+      if (!linked) {
+        throw new Error('Could not link shop to owner');
+      }
+
+      await client.query('COMMIT');
+      return res.status(201).json({ ok: true, shopId, id: shopId });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('[shop-picker] create-shop:', e);
+    return res.status(500).json({ error: e.message || 'Failed to create shop' });
   }
 });
 

@@ -1,5 +1,6 @@
 const Stripe = require('stripe');
 const db = require('../db');
+const { shopLimitForPlan } = require('../lib/planShopLimits');
 
 function getStripe() {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -19,22 +20,6 @@ function mapPriceToPlan(priceId) {
   if (pro && priceId === pro) return 'pro';
   if (premium && priceId === premium) return 'premium';
   return null;
-}
-
-/** Align with pricing: Trial/Starter 1, Pro 3, Premium “unlimited” as high cap (schema requires >= 1). */
-function shopLimitForPlan(plan) {
-  switch (plan) {
-    case 'trial':
-    case 'starter':
-      return 1;
-    case 'pro':
-      return 3;
-    case 'premium':
-      return 99999;
-    case 'expired':
-    default:
-      return 1;
-  }
 }
 
 async function upsertFromSubscription(sub) {
