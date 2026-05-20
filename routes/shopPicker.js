@@ -23,6 +23,95 @@ const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimit
  */
 router.use(requireAuth);
 
+async function resolveProfileId(req) {
+  const uidRow = await db.query(
+    `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+    [req.user.user_id]
+  );
+  return uidRow.rows[0]?.zb_profile_id || null;
+}
+
+/** Ensure owner shops have a shop_users row (fixes list gaps after API-only creates). */
+async function repairOwnerShopLinks(profileId) {
+  const shopRoleCandidates = ['owner', 'admin', 'administrator'];
+  const missing = await db.query(
+    `SELECT s.id::text AS id
+       FROM public.shops s
+      WHERE s.owner_id = $1::uuid
+        AND NOT EXISTS (
+          SELECT 1 FROM public.shop_users su
+           WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+        )`,
+    [profileId]
+  );
+  for (const row of missing.rows || []) {
+    const shopId = row.id;
+    for (const roleTry of shopRoleCandidates) {
+      try {
+        await db.query(
+          `INSERT INTO public.shop_users (shop_id, user_id, role)
+           VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
+          [shopId, profileId, roleTry]
+        );
+        break;
+      } catch (e) {
+        if (e.code === '23505') break;
+      }
+    }
+  }
+}
+
+/**
+ * Shops for My Shops page (owner + membership). Uses Postgres, not Supabase RLS joins.
+ */
+router.get('/my-shops', async (req, res) => {
+  try {
+    const profileId = await resolveProfileId(req);
+    if (!profileId) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    await repairOwnerShopLinks(profileId);
+
+    const listRes = await db.query(
+      `SELECT s.id::text AS id,
+              s.name,
+              s.phone,
+              s.address,
+              s.business_type,
+              s.city,
+              s.currency,
+              s.created_at,
+              COALESCE(
+                (SELECT su.role::text
+                   FROM public.shop_users su
+                  WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+                  ORDER BY CASE su.role::text
+                    WHEN 'owner' THEN 0
+                    WHEN 'admin' THEN 1
+                    WHEN 'administrator' THEN 2
+                    ELSE 3
+                  END
+                  LIMIT 1),
+                'owner'
+              ) AS role
+         FROM public.shops s
+        WHERE s.owner_id = $1::uuid
+           OR EXISTS (
+             SELECT 1 FROM public.shop_users su
+              WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+           )
+        ORDER BY s.created_at DESC`,
+      [profileId]
+    );
+
+    return res.json({ ok: true, shops: listRes.rows || [] });
+  } catch (e) {
+    console.error('[shop-picker] my-shops:', e);
+    return res.status(500).json({ error: e.message || 'Failed to load shops' });
+  }
+});
+
 router.post('/quick-stats', async (req, res) => {
   try {
     const raw = Array.isArray(req.body?.shopIds) ? req.body.shopIds : [];
@@ -116,11 +205,7 @@ router.post('/create-shop', async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid mobile number (at least 10 digits).' });
     }
 
-    const uidRow = await db.query(
-      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
-      [req.user.user_id]
-    );
-    const profileId = uidRow.rows[0]?.zb_profile_id;
+    const profileId = await resolveProfileId(req);
     if (!profileId) {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
     }
@@ -208,7 +293,18 @@ router.post('/create-shop', async (req, res) => {
       }
 
       await client.query('COMMIT');
-      return res.status(201).json({ ok: true, shopId, id: shopId });
+      const shopRow = await db.query(
+        `SELECT id::text AS id, name, phone, address, business_type, city, currency, created_at
+           FROM public.shops WHERE id = $1::uuid`,
+        [shopId]
+      );
+      const shop = shopRow.rows[0] || { id: shopId, name };
+      return res.status(201).json({
+        ok: true,
+        shopId,
+        id: shopId,
+        shop: { ...shop, role: 'owner', memberRole: 'owner' },
+      });
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
