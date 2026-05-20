@@ -241,6 +241,7 @@ app.use('/api/updates', require('./routes/updates'));
 app.use('/api/billing', require('./routes/billing'));
 app.use('/api/otp', require('./routes/otp'));
 app.use('/api/shop-picker', require('./routes/shopPicker'));
+app.use('/api/daily-closing', require('./routes/dailyClosing'));
 app.use('/api/units', require('./routes/units'));
 
 // Catch-all route for React app (must be last, after all API routes)

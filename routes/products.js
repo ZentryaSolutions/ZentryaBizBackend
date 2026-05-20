@@ -446,5 +446,101 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+/** Bulk import products from parsed CSV rows (frontend sends JSON). */
+router.post('/import-bulk', async (req, res) => {
+  const shopId = req.shopId;
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) {
+    return res.status(400).json({ error: 'No rows to import' });
+  }
+  if (rows.length > 2000) {
+    return res.status(400).json({ error: 'Maximum 2000 products per import' });
+  }
+
+  const preview = [];
+  const toInsert = [];
+  const client = await db.getClient();
+
+  try {
+    for (let i = 0; i < rows.length; i += 1) {
+      const r = rows[i] || {};
+      const name = String(r.name || r.Name || '').trim();
+      const sku = r.sku != null ? String(r.sku).trim() : '';
+      const category = String(r.category || r.Category || 'General').trim() || 'General';
+      const unit = String(r.unit || r.Unit || 'piece').trim() || 'piece';
+      const selling = parseFloat(r.selling_price ?? r['Selling Price'] ?? r.selling);
+      const wholesale = parseFloat(r.wholesale_price ?? r['Wholesale Price'] ?? selling);
+      const stock = parseFloat(r.opening_stock ?? r['Opening Stock'] ?? 0);
+
+      const errors = [];
+      if (!name) errors.push('Name is required');
+      if (!Number.isFinite(selling) || selling < 0) errors.push('Invalid selling price');
+      if (!Number.isFinite(wholesale) || wholesale < 0) errors.push('Invalid wholesale price');
+      if (!Number.isFinite(stock) || stock < 0) errors.push('Invalid opening stock');
+
+      preview.push({ row: i + 1, name, sku, category, unit, selling_price: selling, wholesale_price: wholesale, opening_stock: stock, errors });
+      if (!errors.length) {
+        toInsert.push({ name, sku, category, unit, selling, wholesale, stock });
+      }
+    }
+
+    if (req.body?.previewOnly) {
+      return res.json({ preview, validCount: toInsert.length, errorCount: preview.length - toInsert.length });
+    }
+
+    if (!toInsert.length) {
+      return res.status(400).json({ error: 'No valid rows', preview });
+    }
+
+    await client.query('BEGIN');
+    let created = 0;
+    for (const row of toInsert) {
+      let finalCategoryId = null;
+      const catRes = await client.query(
+        `SELECT category_id FROM categories WHERE shop_id = $1 AND LOWER(TRIM(category_name)) = LOWER($2) LIMIT 1`,
+        [shopId, row.category]
+      );
+      if (catRes.rows.length) {
+        finalCategoryId = catRes.rows[0].category_id;
+      } else {
+        const ins = await client.query(
+          `INSERT INTO categories (category_name, status, shop_id) VALUES ($1,'active',$2) RETURNING category_id`,
+          [row.category, shopId]
+        );
+        finalCategoryId = ins.rows[0].category_id;
+      }
+
+      await client.query(
+        `INSERT INTO products (
+          name, item_name_english, sku, category, category_id,
+          purchase_price, selling_price, retail_price, wholesale_price,
+          unit_type, quantity_in_stock, shop_id
+        ) VALUES ($1,$1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10)`,
+        [
+          row.name,
+          row.sku || null,
+          row.category,
+          finalCategoryId,
+          row.wholesale,
+          row.selling,
+          row.wholesale,
+          row.unit,
+          row.stock,
+          shopId,
+        ]
+      );
+      created += 1;
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ ok: true, created, preview });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('[products] import-bulk:', e);
+    res.status(500).json({ error: e.message || 'Import failed', preview });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
 

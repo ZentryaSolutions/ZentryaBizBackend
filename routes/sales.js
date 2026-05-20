@@ -767,6 +767,249 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+async function generateCreditNoteNumber(shopId, client) {
+  const q = client || db;
+  const result = await q.query(
+    `SELECT invoice_number FROM sales
+     WHERE shop_id = $1 AND invoice_number ILIKE 'CN-%'
+     ORDER BY sale_id DESC LIMIT 1`,
+    [shopId]
+  );
+  if (!result.rows.length) return 'CN-00001';
+  const last = String(result.rows[0].invoice_number || '');
+  const match = last.match(/CN-(\d+)/i);
+  if (match) {
+    const next = parseInt(match[1], 10) + 1;
+    return `CN-${String(next).padStart(5, '0')}`;
+  }
+  return 'CN-00001';
+}
+
+/**
+ * Return / refund — creates credit note, restores stock, adjusts customer balance.
+ * Body: { items: [{ product_id, quantity }], refund_type: 'cash'|'credit' }
+ */
+router.post('/:id/return', async (req, res) => {
+  const client = await db.getClient();
+  try {
+    const originalId = parseInt(req.params.id, 10);
+    if (Number.isNaN(originalId)) {
+      return res.status(400).json({ error: 'Invalid sale id' });
+    }
+
+    const returnItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!returnItems.length) {
+      return res.status(400).json({ error: 'Select at least one item to return' });
+    }
+
+    const refundType = String(req.body?.refund_type || 'cash').toLowerCase() === 'credit' ? 'credit' : 'cash';
+
+    await client.query('BEGIN');
+
+    const origRes = await client.query(
+      `SELECT * FROM sales WHERE sale_id = $1 AND shop_id = $2`,
+      [originalId, req.shopId]
+    );
+    if (!origRes.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Original invoice not found' });
+    }
+    const original = origRes.rows[0];
+    if (String(original.invoice_number || '').toUpperCase().startsWith('CN-')) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cannot return a credit note' });
+    }
+
+    const origItemsRes = await client.query(
+      `SELECT sale_item_id, product_id, quantity, selling_price, purchase_price
+       FROM sale_items WHERE sale_id = $1`,
+      [originalId]
+    );
+    const origByProduct = new Map();
+    origItemsRes.rows.forEach((row) => {
+      const pid = parseInt(row.product_id, 10);
+      const prev = origByProduct.get(pid) || { qty: 0, selling_price: row.selling_price, purchase_price: row.purchase_price };
+      prev.qty += parseFloat(row.quantity) || 0;
+      origByProduct.set(pid, prev);
+    });
+
+    let returnedByProduct = new Map();
+    try {
+      const prevReturns = await client.query(
+        `SELECT s.sale_id FROM sales s
+         WHERE s.shop_id = $1 AND (
+           s.original_sale_id = $2
+           OR (s.invoice_number ILIKE 'CN-%' AND COALESCE(s.notes,'') LIKE $3)
+         )`,
+        [req.shopId, originalId, `%REF:${original.invoice_number}%`]
+      );
+      for (const row of prevReturns.rows) {
+        const ri = await client.query(
+          `SELECT product_id, quantity FROM sale_items WHERE sale_id = $1`,
+          [row.sale_id]
+        );
+        ri.rows.forEach((it) => {
+          const pid = parseInt(it.product_id, 10);
+          returnedByProduct.set(pid, (returnedByProduct.get(pid) || 0) + (parseFloat(it.quantity) || 0));
+        });
+      }
+    } catch {
+      returnedByProduct = new Map();
+    }
+
+    let subtotalReturn = 0;
+    let totalProfitReturn = 0;
+    const linesToInsert = [];
+
+    for (const line of returnItems) {
+      const pid = parseInt(line.product_id, 10);
+      const qty = parseFloat(line.quantity);
+      if (!pid || !qty || qty <= 0) continue;
+
+      const orig = origByProduct.get(pid);
+      if (!orig) {
+        throw new Error(`Product ${pid} was not on the original invoice`);
+      }
+      const already = returnedByProduct.get(pid) || 0;
+      const remaining = orig.qty - already;
+      if (qty > remaining + 1e-6) {
+        throw new Error(`Return quantity exceeds remaining for product ${pid} (max ${remaining})`);
+      }
+
+      const sp = parseFloat(line.selling_price) || parseFloat(orig.selling_price) || 0;
+      const pp = parseFloat(orig.purchase_price) || 0;
+      subtotalReturn += sp * qty;
+      totalProfitReturn += (sp - pp) * qty;
+      linesToInsert.push({ product_id: pid, quantity: qty, selling_price: sp, purchase_price: pp });
+    }
+
+    if (!linesToInsert.length) {
+      throw new Error('No valid return lines');
+    }
+
+    const grandTotal = subtotalReturn;
+    let paymentType = 'cash';
+    let paidAmount = grandTotal;
+    if (refundType === 'credit' && original.customer_id) {
+      paymentType = 'credit';
+      paidAmount = 0;
+    } else if (original.customer_id && ['credit', 'split'].includes(String(original.payment_type || '').toLowerCase())) {
+      paymentType = 'credit';
+      paidAmount = 0;
+    }
+
+    const creditNoteNumber = await generateCreditNoteNumber(req.shopId, client);
+    const userId = req.user?.user_id || null;
+    const saleBusinessDate = await getBusinessTodayDateString(client);
+    const returnNotes = `REF:${original.invoice_number}`;
+
+    let saleResult;
+    const baseParams = [
+      creditNoteNumber,
+      original.customer_id || null,
+      original.customer_name || null,
+      subtotalReturn,
+      0,
+      0,
+      grandTotal,
+      paidAmount,
+      paymentType,
+      totalProfitReturn,
+      userId,
+      saleBusinessDate,
+      req.shopId,
+      returnNotes,
+    ];
+
+    try {
+      saleResult = await client.query(
+        `INSERT INTO sales (
+           invoice_number, customer_id, customer_name, subtotal, discount, tax,
+           total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes,
+           sale_kind, original_sale_id
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'return',$15)
+         RETURNING *`,
+        [...baseParams, originalId]
+      );
+    } catch (e) {
+      if (e.code === '42703') {
+        saleResult = await client.query(
+          `INSERT INTO sales (
+             invoice_number, customer_id, customer_name, subtotal, discount, tax,
+             total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           RETURNING *`,
+          baseParams
+        );
+      } else {
+        throw e;
+      }
+    }
+
+    const returnSaleId = saleResult.rows[0].sale_id;
+
+    for (const line of linesToInsert) {
+      const profit = (line.selling_price - line.purchase_price) * line.quantity;
+      await client.query(
+        `INSERT INTO sale_items (sale_id, product_id, quantity, selling_price, purchase_price, profit)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [returnSaleId, line.product_id, line.quantity, line.selling_price, line.purchase_price, profit]
+      );
+      await client.query(
+        `UPDATE products SET quantity_in_stock = quantity_in_stock + $1
+         WHERE product_id = $2 AND shop_id = $3`,
+        [line.quantity, line.product_id, req.shopId]
+      );
+    }
+
+    if (original.customer_id) {
+      await client.query(
+        `UPDATE customers
+         SET current_balance = opening_balance +
+           COALESCE((SELECT SUM(
+             CASE WHEN invoice_number ILIKE 'CN-%' THEN -(total_amount - paid_amount)
+                  ELSE (total_amount - paid_amount) END
+           ) FROM sales WHERE customer_id = $1 AND shop_id = $2 AND payment_type IN ('credit','split')), 0) -
+           COALESCE((SELECT SUM(amount) FROM customer_payments WHERE customer_id = $1), 0)
+         WHERE customer_id = $1`,
+        [original.customer_id, req.shopId]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const detail = await db.query(
+      `SELECT s.*, (
+         SELECT json_agg(json_build_object(
+           'product_id', si.product_id,
+           'quantity', si.quantity,
+           'selling_price', si.selling_price,
+           'product_name', COALESCE(p.item_name_english, p.name)
+         ))
+         FROM sale_items si
+         JOIN products p ON p.product_id = si.product_id AND p.shop_id = s.shop_id
+         WHERE si.sale_id = s.sale_id
+       ) AS items
+       FROM sales s WHERE s.sale_id = $1`,
+      [returnSaleId]
+    );
+
+    res.status(201).json({
+      ...detail.rows[0],
+      refund_type: refundType,
+      refund_cash_amount: refundType === 'cash' ? grandTotal : 0,
+      original_invoice: original.invoice_number,
+      message: 'Return recorded as credit note',
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error creating return:', error);
+    res.status(400).json({ error: error.message || 'Failed to process return' });
+  } finally {
+    client.release();
+  }
+});
+
 // Finalize invoice (prevent further editing)
 router.post('/:id/finalize', async (req, res) => {
   try {
