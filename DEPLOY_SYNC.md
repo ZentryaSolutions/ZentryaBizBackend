@@ -1,4 +1,4 @@
-# Deploy sync 2026-05-22 00:20
+# Vercel deploy sync
+Updated: 2026-05-22 00:42:12
 
-- sales detail: customer_phone for WhatsApp
-
+Includes: customer_phone on sales detail, shop picker RPC, returns, daily closing, SSL pooler fix.
