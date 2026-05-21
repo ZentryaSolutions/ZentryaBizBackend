@@ -125,21 +125,25 @@ router.post('/quick-stats', async (req, res) => {
       return res.json({ ok: true, stats: {} });
     }
 
-    const uidRow = await db.query(
-      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
-      [req.user.user_id]
-    );
-    const profileId = uidRow.rows[0]?.zb_profile_id;
+    const profileId = await resolveProfileId(req);
     if (!profileId) {
       return res.json({ ok: true, stats: {} });
     }
 
-    // shop_users.user_id is the Supabase/Zentrya profile UUID, not users.user_id (integer)
+    await repairOwnerShopLinks(profileId);
+
+    // Member shops + owned shops (owner may exist before shop_users row is visible)
     const allowedRes = await db.query(
-      `SELECT shop_id::text AS shop_id
-         FROM shop_users
-        WHERE user_id = $1::uuid
-          AND shop_id = ANY($2::uuid[])`,
+      `SELECT s.id::text AS shop_id
+         FROM public.shops s
+        WHERE s.id = ANY($2::uuid[])
+          AND (
+            s.owner_id = $1::uuid
+            OR EXISTS (
+              SELECT 1 FROM public.shop_users su
+               WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+            )
+          )`,
       [profileId, shopIds]
     );
     const allowed = new Set((allowedRes.rows || []).map((r) => String(r.shop_id || '').trim()));
@@ -149,45 +153,52 @@ router.post('/quick-stats', async (req, res) => {
       return res.json({ ok: true, stats: {} });
     }
 
-    const todayStr = getBusinessTodayDateString(); // YYYY-MM-DD (server/business TZ)
-
-    const [salesRes, prodRes] = await Promise.all([
-      db.query(
-        `SELECT shop_id, COALESCE(SUM(total_amount), 0) AS total
-           FROM sales
-          WHERE shop_id = ANY($1::text[])
-            AND date = $2::date
-          GROUP BY shop_id`,
-        [allowedIds, todayStr]
-      ),
-      db.query(
-        `SELECT shop_id, COUNT(*)::int AS cnt
-           FROM products
-          WHERE shop_id = ANY($1::text[])
-          GROUP BY shop_id`,
-        [allowedIds]
-      ),
-    ]);
-
+    const todayStr = getBusinessTodayDateString();
     const byShop = {};
     allowedIds.forEach((id) => {
       byShop[String(id)] = { todaySales: 0, productCount: 0 };
     });
 
-    (salesRes.rows || []).forEach((r) => {
-      const sid = String(r.shop_id);
-      if (!byShop[sid]) byShop[sid] = { todaySales: 0, productCount: 0 };
-      byShop[sid].todaySales = Number(r.total) || 0;
-    });
-    (prodRes.rows || []).forEach((r) => {
-      const sid = String(r.shop_id);
-      if (!byShop[sid]) byShop[sid] = { todaySales: 0, productCount: 0 };
-      byShop[sid].productCount = Number(r.cnt) || 0;
-    });
+    const mergeStats = (rows, field) => {
+      (rows || []).forEach((r) => {
+        const sid = String(r.shop_id);
+        if (!byShop[sid]) byShop[sid] = { todaySales: 0, productCount: 0 };
+        byShop[sid][field] = Number(r.val) || 0;
+      });
+    };
+
+    try {
+      const salesRes = await db.query(
+        `SELECT shop_id::text AS shop_id, COALESCE(SUM(total_amount), 0) AS val
+           FROM sales
+          WHERE shop_id::text = ANY($1::text[])
+            AND date::date = $2::date
+            AND COALESCE(sale_kind, 'sale') = 'sale'
+          GROUP BY shop_id::text`,
+        [allowedIds, todayStr]
+      );
+      mergeStats(salesRes.rows, 'todaySales');
+    } catch (salesErr) {
+      console.warn('[shop-picker] quick-stats sales:', salesErr.message);
+    }
+
+    try {
+      const prodRes = await db.query(
+        `SELECT shop_id::text AS shop_id, COUNT(*)::int AS val
+           FROM products
+          WHERE shop_id::text = ANY($1::text[])
+          GROUP BY shop_id::text`,
+        [allowedIds]
+      );
+      mergeStats(prodRes.rows, 'productCount');
+    } catch (prodErr) {
+      console.warn('[shop-picker] quick-stats products:', prodErr.message);
+    }
 
     return res.json({ ok: true, stats: byShop });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: 'quick-stats failed' });
+    console.error('[shop-picker] quick-stats:', e);
+    return res.status(500).json({ ok: false, error: e.message || 'quick-stats failed' });
   }
 });
 
