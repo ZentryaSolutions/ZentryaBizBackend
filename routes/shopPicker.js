@@ -24,38 +24,107 @@ const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimit
 router.use(requireAuth);
 
 async function resolveProfileId(req) {
+  const headerId = String(req.headers['x-zb-profile-id'] || '').trim();
+  if (UUID_RE.test(headerId)) return headerId;
+
   const uidRow = await db.query(
-    `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+    `SELECT zb_profile_id::text AS zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
     [req.user.user_id]
   );
   return uidRow.rows[0]?.zb_profile_id || null;
 }
 
-/** Ensure owner shops have a shop_users row (fixes list gaps after API-only creates). */
-async function repairOwnerShopLinks(profileId) {
+/** Collect every profile UUID tied to this login (fixes legacy split zb_simple_users vs profiles ids). */
+async function resolveLinkedProfileIds(req) {
+  const base = await resolveProfileId(req);
+  if (!base) return [];
+
+  const ids = new Set([String(base)]);
+
+  const linkRes = await db.query(
+    `SELECT DISTINCT x.id::text AS id
+       FROM (
+         SELECT u.zb_profile_id AS id
+           FROM users u
+          WHERE u.user_id = $1 AND u.is_active = true AND u.zb_profile_id IS NOT NULL
+         UNION
+         SELECT su.user_id AS id
+           FROM shop_users su
+          WHERE su.user_id = $2::uuid
+         UNION
+         SELECT s.owner_id AS id
+           FROM shops s
+          WHERE s.owner_id = $2::uuid
+             OR EXISTS (
+               SELECT 1 FROM shop_users su
+                WHERE su.shop_id = s.id AND su.user_id = $2::uuid
+             )
+       ) x
+      WHERE x.id IS NOT NULL`,
+    [req.user.user_id, base]
+  );
+  (linkRes.rows || []).forEach((r) => {
+    const id = String(r.id || '').trim();
+    if (UUID_RE.test(id)) ids.add(id);
+  });
+
+  return [...ids];
+}
+
+/** Ensure owner shops have shop_users rows for every linked profile id. */
+async function repairOwnerShopLinks(profileIds) {
+  const ids = (profileIds || []).filter((id) => UUID_RE.test(String(id)));
+  if (!ids.length) return;
+
   const shopRoleCandidates = ['owner', 'admin', 'administrator'];
   const missing = await db.query(
-    `SELECT s.id::text AS id
+    `SELECT s.id::text AS shop_id, s.owner_id::text AS owner_id
        FROM public.shops s
-      WHERE s.owner_id = $1::uuid
+      WHERE s.owner_id = ANY($1::uuid[])
         AND NOT EXISTS (
           SELECT 1 FROM public.shop_users su
-           WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+           WHERE su.shop_id = s.id AND su.user_id = s.owner_id
         )`,
-    [profileId]
+    [ids]
   );
+
   for (const row of missing.rows || []) {
-    const shopId = row.id;
+    const shopId = row.shop_id;
+    const linkAs = UUID_RE.test(String(row.owner_id || '')) ? row.owner_id : ids[0];
     for (const roleTry of shopRoleCandidates) {
       try {
         await db.query(
           `INSERT INTO public.shop_users (shop_id, user_id, role)
            VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
-          [shopId, profileId, roleTry]
+          [shopId, linkAs, roleTry]
         );
         break;
       } catch (e) {
         if (e.code === '23505') break;
+      }
+    }
+  }
+
+  // Legacy: owner_id may differ from shop_users.user_id — link all known profile ids to owned shops
+  const legacy = await db.query(
+    `SELECT s.id::text AS shop_id
+       FROM public.shops s
+      WHERE s.owner_id = ANY($1::uuid[])`,
+    [ids]
+  );
+  for (const row of legacy.rows || []) {
+    for (const pid of ids) {
+      for (const roleTry of shopRoleCandidates) {
+        try {
+          await db.query(
+            `INSERT INTO public.shop_users (shop_id, user_id, role)
+             VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
+            [row.shop_id, pid, roleTry]
+          );
+          break;
+        } catch (e) {
+          if (e.code === '23505') break;
+        }
       }
     }
   }
@@ -66,12 +135,12 @@ async function repairOwnerShopLinks(profileId) {
  */
 router.get('/my-shops', async (req, res) => {
   try {
-    const profileId = await resolveProfileId(req);
-    if (!profileId) {
+    const profileIds = await resolveLinkedProfileIds(req);
+    if (!profileIds.length) {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
     }
 
-    await repairOwnerShopLinks(profileId);
+    await repairOwnerShopLinks(profileIds);
 
     const listRes = await db.query(
       `SELECT s.id::text AS id,
@@ -85,7 +154,7 @@ router.get('/my-shops', async (req, res) => {
               COALESCE(
                 (SELECT su.role::text
                    FROM public.shop_users su
-                  WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+                  WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
                   ORDER BY CASE su.role::text
                     WHEN 'owner' THEN 0
                     WHEN 'admin' THEN 1
@@ -96,16 +165,16 @@ router.get('/my-shops', async (req, res) => {
                 'owner'
               ) AS role
          FROM public.shops s
-        WHERE s.owner_id = $1::uuid
+        WHERE s.owner_id = ANY($1::uuid[])
            OR EXISTS (
              SELECT 1 FROM public.shop_users su
-              WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+              WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
            )
         ORDER BY s.created_at DESC`,
-      [profileId]
+      [profileIds]
     );
 
-    return res.json({ ok: true, shops: listRes.rows || [] });
+    return res.json({ ok: true, shops: listRes.rows || [], profileIds });
   } catch (e) {
     console.error('[shop-picker] my-shops:', e);
     return res.status(500).json({ error: e.message || 'Failed to load shops' });
@@ -125,26 +194,25 @@ router.post('/quick-stats', async (req, res) => {
       return res.json({ ok: true, stats: {} });
     }
 
-    const profileId = await resolveProfileId(req);
-    if (!profileId) {
+    const profileIds = await resolveLinkedProfileIds(req);
+    if (!profileIds.length) {
       return res.json({ ok: true, stats: {} });
     }
 
-    await repairOwnerShopLinks(profileId);
+    await repairOwnerShopLinks(profileIds);
 
-    // Member shops + owned shops (owner may exist before shop_users row is visible)
     const allowedRes = await db.query(
       `SELECT s.id::text AS shop_id
          FROM public.shops s
         WHERE s.id = ANY($2::uuid[])
           AND (
-            s.owner_id = $1::uuid
+            s.owner_id = ANY($1::uuid[])
             OR EXISTS (
               SELECT 1 FROM public.shop_users su
-               WHERE su.shop_id = s.id AND su.user_id = $1::uuid
+               WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
             )
           )`,
-      [profileId, shopIds]
+      [profileIds, shopIds]
     );
     const allowed = new Set((allowedRes.rows || []).map((r) => String(r.shop_id || '').trim()));
     const allowedIds = shopIds.filter((id) => allowed.has(String(id)));
@@ -216,21 +284,28 @@ router.post('/create-shop', async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid mobile number (at least 10 digits).' });
     }
 
-    const profileId = await resolveProfileId(req);
-    if (!profileId) {
+    const profileIds = await resolveLinkedProfileIds(req);
+    const ownerId = await resolveProfileId(req);
+    if (!profileIds.length || !ownerId) {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
     }
 
     let prof;
     try {
       prof = await db.query(
-        `SELECT plan::text AS plan, shop_limit FROM public.profiles WHERE id = $1::uuid LIMIT 1`,
-        [profileId]
+        `SELECT plan::text AS plan, shop_limit
+           FROM public.profiles
+          WHERE id = ANY($1::uuid[])
+          ORDER BY CASE lower(coalesce(plan::text, 'trial'))
+            WHEN 'premium' THEN 0 WHEN 'pro' THEN 1 WHEN 'starter' THEN 2 WHEN 'trial' THEN 3 ELSE 4
+          END
+          LIMIT 1`,
+        [profileIds]
       );
     } catch (colErr) {
       prof = await db.query(
-        `SELECT plan::text AS plan FROM public.profiles WHERE id = $1::uuid LIMIT 1`,
-        [profileId]
+        `SELECT plan::text AS plan FROM public.profiles WHERE id = ANY($1::uuid[]) LIMIT 1`,
+        [profileIds]
       );
     }
     if (!prof.rows.length) {
@@ -249,8 +324,10 @@ router.post('/create-shop', async (req, res) => {
 
     if (!isUnlimitedShopLimit(limit)) {
       const countRes = await db.query(
-        `SELECT COUNT(*)::int AS c FROM public.shops WHERE owner_id = $1::uuid`,
-        [profileId]
+        `SELECT COUNT(DISTINCT s.id)::int AS c
+           FROM public.shops s
+          WHERE s.owner_id = ANY($1::uuid[])`,
+        [profileIds]
       );
       const used = Number(countRes.rows[0]?.c) || 0;
       if (used >= limit) {
@@ -276,28 +353,31 @@ router.post('/create-shop', async (req, res) => {
         `INSERT INTO public.shops (owner_id, name, phone, address, business_type, city, currency)
          VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
          RETURNING id::text AS id`,
-        [profileId, name, phone, address, businessType, city, currency]
+        [ownerId, name, phone, address, businessType, city, currency]
       );
       const shopId = shopRes.rows[0]?.id;
       if (!shopId) throw new Error('Shop insert failed');
 
       const shopRoleCandidates = ['owner', 'admin', 'administrator'];
       let linked = false;
-      for (const roleTry of shopRoleCandidates) {
-        try {
-          await client.query(
-            `INSERT INTO public.shop_users (shop_id, user_id, role)
-             VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
-            [shopId, profileId, roleTry]
-          );
-          linked = true;
-          break;
-        } catch (e) {
-          if (e.code === '23505') {
+      for (const pid of profileIds) {
+        for (const roleTry of shopRoleCandidates) {
+          try {
+            await client.query(
+              `INSERT INTO public.shop_users (shop_id, user_id, role)
+               VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
+              [shopId, pid, roleTry]
+            );
             linked = true;
             break;
+          } catch (e) {
+            if (e.code === '23505') {
+              linked = true;
+              break;
+            }
           }
         }
+        if (linked) break;
       }
       if (!linked) {
         throw new Error('Could not link shop to owner');
