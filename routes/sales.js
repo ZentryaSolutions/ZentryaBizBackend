@@ -768,6 +768,85 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+/** Sale ids for prior credit notes against this invoice (schema-safe: original_sale_id → notes → none). */
+async function loadPreviousReturnSaleIds(client, shopId, originalId, invoiceNumber) {
+  await client.query('SAVEPOINT sp_prev_returns');
+  try {
+    const r = await client.query(
+      `SELECT sale_id FROM sales WHERE shop_id = $1 AND original_sale_id = $2`,
+      [shopId, originalId]
+    );
+    await client.query('RELEASE SAVEPOINT sp_prev_returns');
+    return r.rows.map((row) => row.sale_id);
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT sp_prev_returns');
+    if (e.code !== '42703') throw e;
+  }
+
+  await client.query('SAVEPOINT sp_prev_returns');
+  try {
+    const r = await client.query(
+      `SELECT sale_id FROM sales
+       WHERE shop_id = $1 AND invoice_number ILIKE 'CN-%' AND COALESCE(notes, '') LIKE $2`,
+      [shopId, `%REF:${invoiceNumber}%`]
+    );
+    await client.query('RELEASE SAVEPOINT sp_prev_returns');
+    return r.rows.map((row) => row.sale_id);
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT sp_prev_returns');
+    if (e.code !== '42703') throw e;
+  }
+
+  return [];
+}
+
+/** Insert credit-note row; tries extended columns, then notes only, then base columns. */
+async function insertReturnSaleRecord(client, baseWithNotes, baseNoNotes, originalId) {
+  const tries = [
+    {
+      sql: `INSERT INTO sales (
+         invoice_number, customer_id, customer_name, subtotal, discount, tax,
+         total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes,
+         sale_kind, original_sale_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'return',$15)
+       RETURNING *`,
+      params: [...baseWithNotes, originalId],
+    },
+    {
+      sql: `INSERT INTO sales (
+         invoice_number, customer_id, customer_name, subtotal, discount, tax,
+         total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      params: baseWithNotes,
+    },
+    {
+      sql: `INSERT INTO sales (
+         invoice_number, customer_id, customer_name, subtotal, discount, tax,
+         total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      params: baseNoNotes,
+    },
+  ];
+
+  for (const t of tries) {
+    await client.query('SAVEPOINT sp_return_ins');
+    try {
+      const result = await client.query(t.sql, t.params);
+      await client.query('RELEASE SAVEPOINT sp_return_ins');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_return_ins');
+      if (e.code !== '42703') throw e;
+    }
+  }
+
+  throw new Error(
+    'Could not save credit note. Run database/migrations/009_sales_returns_daily_closing.sql in Supabase SQL Editor.'
+  );
+}
+
 async function generateCreditNoteNumber(shopId, client) {
   const q = client || db;
   const result = await q.query(
@@ -834,19 +913,17 @@ router.post('/:id/return', async (req, res) => {
       origByProduct.set(pid, prev);
     });
 
-    // Previous returns: match credit notes linked via notes REF:invoice (no failing query on missing columns)
     let returnedByProduct = new Map();
-    const prevReturns = await client.query(
-      `SELECT s.sale_id FROM sales s
-       WHERE s.shop_id = $1
-         AND s.invoice_number ILIKE 'CN-%'
-         AND COALESCE(s.notes, '') LIKE $2`,
-      [req.shopId, `%REF:${original.invoice_number}%`]
+    const prevReturnIds = await loadPreviousReturnSaleIds(
+      client,
+      req.shopId,
+      originalId,
+      original.invoice_number
     );
-    for (const row of prevReturns.rows) {
+    for (const prevSaleId of prevReturnIds) {
       const ri = await client.query(
         `SELECT product_id, quantity FROM sale_items WHERE sale_id = $1`,
-        [row.sale_id]
+        [prevSaleId]
       );
       ri.rows.forEach((it) => {
         const pid = parseInt(it.product_id, 10);
@@ -900,7 +977,7 @@ router.post('/:id/return', async (req, res) => {
     const saleBusinessDate = await getBusinessTodayDateString(client);
     const returnNotes = `REF:${original.invoice_number}`;
 
-    const baseParams = [
+    const baseNoNotes = [
       creditNoteNumber,
       original.customer_id || null,
       original.customer_name || null,
@@ -914,37 +991,15 @@ router.post('/:id/return', async (req, res) => {
       userId,
       saleBusinessDate,
       req.shopId,
-      returnNotes,
     ];
+    const baseWithNotes = [...baseNoNotes, returnNotes];
 
-    let saleResult;
-    await client.query('SAVEPOINT return_insert_sale');
-    try {
-      saleResult = await client.query(
-        `INSERT INTO sales (
-           invoice_number, customer_id, customer_name, subtotal, discount, tax,
-           total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes,
-           sale_kind, original_sale_id
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'return',$15)
-         RETURNING *`,
-        [...baseParams, originalId]
-      );
-      await client.query('RELEASE SAVEPOINT return_insert_sale');
-    } catch (e) {
-      await client.query('ROLLBACK TO SAVEPOINT return_insert_sale');
-      if (e.code === '42703') {
-        saleResult = await client.query(
-          `INSERT INTO sales (
-             invoice_number, customer_id, customer_name, subtotal, discount, tax,
-             total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-           RETURNING *`,
-          baseParams
-        );
-      } else {
-        throw e;
-      }
-    }
+    const saleResult = await insertReturnSaleRecord(
+      client,
+      baseWithNotes,
+      baseNoNotes,
+      originalId
+    );
 
     const returnSaleId = saleResult.rows[0].sale_id;
 
