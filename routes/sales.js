@@ -131,6 +131,7 @@ router.get('/:id', async (req, res) => {
           s.invoice_number,
           s.date,
           COALESCE(c.name, s.customer_name) AS customer_name,
+          c.phone AS customer_phone,
           s.customer_id,
           s.subtotal,
           s.discount,
