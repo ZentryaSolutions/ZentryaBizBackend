@@ -12,6 +12,67 @@ const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
 const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimits');
 
+async function insertShopRow(client, row) {
+  const {
+    ownerId,
+    name,
+    phone,
+    address,
+    businessType,
+    city,
+    currency,
+  } = row;
+  try {
+    return await client.query(
+      `INSERT INTO public.shops (owner_id, name, phone, address, business_type, city, currency)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+       RETURNING id::text AS id`,
+      [ownerId, name, phone, address, businessType, city, currency]
+    );
+  } catch (e) {
+    if (e.code !== '42703') throw e;
+    return client.query(
+      `INSERT INTO public.shops (owner_id, name, business_type, city, currency)
+       VALUES ($1::uuid, $2, $3, $4, $5)
+       RETURNING id::text AS id`,
+      [ownerId, name, businessType, city, currency]
+    );
+  }
+}
+
+async function createShopViaRpc(ownerId, payload) {
+  try {
+    const rpc = await db.query(
+      `SELECT public.zb_create_shop(
+         $1::uuid, $2::text, $3::text, $4::text, $5::text, $6::text, $7::text
+       ) AS data`,
+      [
+        ownerId,
+        payload.name,
+        payload.phone,
+        payload.address,
+        payload.businessType,
+        payload.city,
+        payload.currency,
+      ]
+    );
+    const raw = rpc.rows[0]?.data;
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data?.ok && (data.shopId || data.id)) return data;
+    if (data?.error) {
+      const err = new Error(String(data.error));
+      err.code = 'ZB_CREATE_SHOP_RPC';
+      throw err;
+    }
+  } catch (e) {
+    if (e.code === '42883' || /zb_create_shop/i.test(String(e.message || ''))) {
+      return null;
+    }
+    throw e;
+  }
+  return null;
+}
+
 /**
  * Shop picker quick stats (multi-shop).
  * - Requires auth (x-session-id)
@@ -346,15 +407,39 @@ router.post('/create-shop', async (req, res) => {
     const city = req.body?.city != null ? String(req.body.city).trim() || null : null;
     const currency = String(req.body?.currency || 'PKR').trim() || 'PKR';
 
+    const rpcResult = await createShopViaRpc(ownerId, {
+      name,
+      phone,
+      address,
+      businessType,
+      city,
+      currency,
+    });
+    if (rpcResult?.ok) {
+      const shopId = rpcResult.shopId || rpcResult.id;
+      const shop = rpcResult.shop || { id: shopId, name };
+      return res.status(201).json({
+        ok: true,
+        shopId,
+        id: shopId,
+        persisted: true,
+        via: 'rpc',
+        shop: { ...shop, role: 'owner', memberRole: 'owner' },
+      });
+    }
+
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
-      const shopRes = await client.query(
-        `INSERT INTO public.shops (owner_id, name, phone, address, business_type, city, currency)
-         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
-         RETURNING id::text AS id`,
-        [ownerId, name, phone, address, businessType, city, currency]
-      );
+      const shopRes = await insertShopRow(client, {
+        ownerId,
+        name,
+        phone,
+        address,
+        businessType,
+        city,
+        currency,
+      });
       const shopId = shopRes.rows[0]?.id;
       if (!shopId) throw new Error('Shop insert failed');
 
@@ -384,16 +469,33 @@ router.post('/create-shop', async (req, res) => {
       }
 
       await client.query('COMMIT');
-      const shopRow = await db.query(
-        `SELECT id::text AS id, name, phone, address, business_type, city, currency, created_at
-           FROM public.shops WHERE id = $1::uuid`,
-        [shopId]
-      );
+
+      const verify = await db.query(`SELECT id::text AS id FROM public.shops WHERE id = $1::uuid`, [shopId]);
+      if (!verify.rows.length) {
+        throw new Error('Shop insert did not persist — check DATABASE_URL on Vercel matches this Supabase project.');
+      }
+
+      let shopRow;
+      try {
+        shopRow = await db.query(
+          `SELECT id::text AS id, name, phone, address, business_type, city, currency, created_at
+             FROM public.shops WHERE id = $1::uuid`,
+          [shopId]
+        );
+      } catch (colErr) {
+        shopRow = await db.query(
+          `SELECT id::text AS id, name, business_type, city, currency, created_at
+             FROM public.shops WHERE id = $1::uuid`,
+          [shopId]
+        );
+      }
       const shop = shopRow.rows[0] || { id: shopId, name };
       return res.status(201).json({
         ok: true,
         shopId,
         id: shopId,
+        persisted: true,
+        via: 'api',
         shop: { ...shop, role: 'owner', memberRole: 'owner' },
       });
     } catch (e) {
