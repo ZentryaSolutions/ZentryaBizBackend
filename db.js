@@ -174,7 +174,7 @@ const testConnection = async (maxRetries = 5, retryDelay = 2000) => {
         const conn = process.env.DATABASE_URL || '';
         if (/ENOTFOUND|getaddrinfo/i.test(msg) && conn.includes('.supabase.co')) {
           console.error(
-            '[db] Supabase tip: Direct host db.<project>.supabase.co is IPv6-only. Windows often hits ENOTFOUND (no usable IPv6). Copy the URI from Dashboard → Connect → "Session pooler" (postgres.<ref>@aws-0-<region>.pooler.supabase.com:5432) into backend/env.local DATABASE_URL.'
+            '[db] Supabase tip: Direct host db.<project>.supabase.co is IPv6-only. Use Dashboard → Connect → "Transaction pooler" (port 6543) in DATABASE_URL for Vercel and Windows.'
           );
         }
         return false;
