@@ -834,28 +834,24 @@ router.post('/:id/return', async (req, res) => {
       origByProduct.set(pid, prev);
     });
 
+    // Previous returns: match credit notes linked via notes REF:invoice (no failing query on missing columns)
     let returnedByProduct = new Map();
-    try {
-      const prevReturns = await client.query(
-        `SELECT s.sale_id FROM sales s
-         WHERE s.shop_id = $1 AND (
-           s.original_sale_id = $2
-           OR (s.invoice_number ILIKE 'CN-%' AND COALESCE(s.notes,'') LIKE $3)
-         )`,
-        [req.shopId, originalId, `%REF:${original.invoice_number}%`]
+    const prevReturns = await client.query(
+      `SELECT s.sale_id FROM sales s
+       WHERE s.shop_id = $1
+         AND s.invoice_number ILIKE 'CN-%'
+         AND COALESCE(s.notes, '') LIKE $2`,
+      [req.shopId, `%REF:${original.invoice_number}%`]
+    );
+    for (const row of prevReturns.rows) {
+      const ri = await client.query(
+        `SELECT product_id, quantity FROM sale_items WHERE sale_id = $1`,
+        [row.sale_id]
       );
-      for (const row of prevReturns.rows) {
-        const ri = await client.query(
-          `SELECT product_id, quantity FROM sale_items WHERE sale_id = $1`,
-          [row.sale_id]
-        );
-        ri.rows.forEach((it) => {
-          const pid = parseInt(it.product_id, 10);
-          returnedByProduct.set(pid, (returnedByProduct.get(pid) || 0) + (parseFloat(it.quantity) || 0));
-        });
-      }
-    } catch {
-      returnedByProduct = new Map();
+      ri.rows.forEach((it) => {
+        const pid = parseInt(it.product_id, 10);
+        returnedByProduct.set(pid, (returnedByProduct.get(pid) || 0) + (parseFloat(it.quantity) || 0));
+      });
     }
 
     let subtotalReturn = 0;
@@ -904,7 +900,6 @@ router.post('/:id/return', async (req, res) => {
     const saleBusinessDate = await getBusinessTodayDateString(client);
     const returnNotes = `REF:${original.invoice_number}`;
 
-    let saleResult;
     const baseParams = [
       creditNoteNumber,
       original.customer_id || null,
@@ -922,6 +917,8 @@ router.post('/:id/return', async (req, res) => {
       returnNotes,
     ];
 
+    let saleResult;
+    await client.query('SAVEPOINT return_insert_sale');
     try {
       saleResult = await client.query(
         `INSERT INTO sales (
@@ -932,7 +929,9 @@ router.post('/:id/return', async (req, res) => {
          RETURNING *`,
         [...baseParams, originalId]
       );
+      await client.query('RELEASE SAVEPOINT return_insert_sale');
     } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT return_insert_sale');
       if (e.code === '42703') {
         saleResult = await client.query(
           `INSERT INTO sales (
@@ -1003,9 +1002,18 @@ router.post('/:id/return', async (req, res) => {
       message: 'Return recorded as credit note',
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      /* connection may already be rolled back */
+    }
     console.error('Error creating return:', error);
-    res.status(400).json({ error: error.message || 'Failed to process return' });
+    const msg = String(error.message || '');
+    const friendly =
+      error.code === '25P02' || msg.includes('transaction is aborted')
+        ? 'Return failed (database schema). Run migration 009_sales_returns_daily_closing.sql in Supabase, then try again.'
+        : msg || 'Failed to process return';
+    res.status(400).json({ error: friendly });
   } finally {
     client.release();
   }
