@@ -13,16 +13,30 @@ if (process.env.DB_DNS_SERVERS) {
   if (list.length) dns.setServers(list);
 }
 
+/** Supabase pooler TLS — avoid "self-signed certificate in certificate chain" on Vercel/Node. */
+function supabaseSsl() {
+  return { rejectUnauthorized: false };
+}
+
 function sslOption() {
   const url = process.env.DATABASE_URL || '';
   const host = process.env.DB_HOST || '';
-  if (url.includes('supabase') || host.includes('supabase')) {
-    return { rejectUnauthorized: false };
+  if (isLikelyRemotePostgres(url, host)) {
+    return supabaseSsl();
   }
   if (process.env.DB_SSL === 'true') {
-    return { rejectUnauthorized: false };
+    return supabaseSsl();
   }
   return false;
+}
+
+/** pg reads sslmode=require from the URL and overrides Pool.ssl — strip it; we set ssl explicitly. */
+function stripUrlSslParams(conn) {
+  let s = String(conn || '').trim();
+  s = s.replace(/([?&])sslmode=[^&]*/gi, '$1');
+  s = s.replace(/([?&])ssl=[^&]*/gi, '$1');
+  s = s.replace(/\?&/, '?').replace(/[?&]$/, '').replace(/\?$/, '');
+  return s;
 }
 
 function isLikelyRemotePostgres(connStr, host) {
@@ -53,9 +67,10 @@ function buildPoolConfig() {
       ? Number(process.env.DB_CONNECTION_TIMEOUT_MS)
       : defaultConnectMs;
   if (conn) {
+    const useSsl = remote || /sslmode=require/i.test(conn);
     return {
-      connectionString: conn,
-      ssl: conn.includes('supabase') ? { rejectUnauthorized: false } : sslOption(),
+      connectionString: remote || useSsl ? stripUrlSslParams(conn) : conn,
+      ssl: useSsl ? supabaseSsl() : sslOption(),
       max: poolMax,
       idleTimeoutMillis,
       connectionTimeoutMillis,
