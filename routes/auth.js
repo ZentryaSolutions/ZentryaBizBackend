@@ -35,6 +35,8 @@ const { issueEmailOtp } = require('../utils/emailOtpIssue');
 const { isDeviceTrusted, addTrustedDevice } = require('../utils/trustedDevices');
 const { consumeLogoutAllToken } = require('../utils/emailSecurityTokens');
 const { sendLoginAlertEmail, getFrontendBaseUrl } = require('../utils/loginAlertEmail');
+const { verifyGoogleIdToken, getGoogleClientId } = require('../utils/googleIdToken');
+const crypto = require('crypto');
 
 function coercePlanForInsert(plan) {
   const s = plan == null || plan === '' ? 'trial' : String(plan).trim().toLowerCase();
@@ -274,6 +276,330 @@ async function resolveZbSimpleLogin(username, password) {
   }
 
   return { ok: true, zb, user };
+}
+
+/** Lookup zb_simple_users by email (no password) — for Google sign-in + OTP completion. */
+async function resolveZbByEmail(email) {
+  const em = normalizeEmail(email);
+  if (!em || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+    return { ok: false, status: 400, body: { error: 'Valid email required' } };
+  }
+  if (!db.isDatabaseConfigured()) {
+    return {
+      ok: false,
+      status: 503,
+      body: { error: 'Database not configured', message: 'Set DATABASE_URL in backend/.env' },
+    };
+  }
+
+  let zbResult;
+  try {
+    zbResult = await db.query(
+      `SELECT id, full_name, username, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+       FROM zb_simple_users
+       WHERE lower(trim(coalesce(email, ''))) = $1 OR lower(trim(username)) = $1
+       LIMIT 1`,
+      [em]
+    );
+  } catch (e) {
+    if (e.code === '42P01') {
+      return {
+        ok: false,
+        status: 503,
+        body: { error: 'zb_simple_users missing', message: 'Run database migrations in Supabase' },
+      };
+    }
+    throw e;
+  }
+
+  if (!zbResult.rows.length) {
+    return { ok: false, status: 404, body: { error: 'Account not found', message: 'No account for this email' } };
+  }
+
+  const zb = zbResult.rows[0];
+  const lookupUserKey = String(zb.username).trim().toLowerCase();
+  let userResult = await db.query(
+    `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+    [lookupUserKey]
+  );
+
+  let user;
+  if (userResult.rows.length > 0) {
+    user = userResult.rows[0];
+    await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
+      zb.id,
+      user.user_id,
+    ]);
+  } else {
+    const displayName = (zb.full_name && String(zb.full_name).trim()) || zb.username || lookupUserKey;
+    const passwordHash = await hashPassword(crypto.randomBytes(24).toString('hex'));
+    const ins = await db.query(
+      `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+       VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+       RETURNING user_id, username, name, role`,
+      [displayName, lookupUserKey, passwordHash, zb.id]
+    );
+    user = ins.rows[0];
+  }
+
+  return { ok: true, zb, user };
+}
+
+/**
+ * Find or create zb_simple_users + users for Google Sign-In.
+ */
+async function resolveOrCreateZbGoogleUser({ email, googleSub, fullName }) {
+  const em = normalizeEmail(email);
+  const sub = String(googleSub || '').trim();
+  const name = String(fullName || '').trim() || em.split('@')[0];
+
+  if (!db.isDatabaseConfigured()) {
+    return {
+      ok: false,
+      status: 503,
+      body: { error: 'Database not configured', message: 'Set DATABASE_URL in backend/.env' },
+    };
+  }
+
+  let bySub;
+  try {
+    bySub = await db.query(
+      `SELECT id, full_name, username, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+       FROM zb_simple_users WHERE google_sub = $1 LIMIT 1`,
+      [sub]
+    );
+  } catch (e) {
+    if (e.code !== '42703') throw e;
+    bySub = { rows: [] };
+  }
+
+  if (bySub.rows.length) {
+    const zb = bySub.rows[0];
+    const lookupUserKey = String(zb.username).trim().toLowerCase();
+    let userResult = await db.query(
+      `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+      [lookupUserKey]
+    );
+    if (userResult.rows.length) {
+      const user = userResult.rows[0];
+      await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
+        zb.id,
+        user.user_id,
+      ]);
+      return { ok: true, zb, user, isNew: false };
+    }
+    const displayName = (zb.full_name && String(zb.full_name).trim()) || name;
+    const passwordHash = await hashPassword(crypto.randomBytes(24).toString('hex'));
+    const ins = await db.query(
+      `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+       VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+       RETURNING user_id, username, name, role`,
+      [displayName, lookupUserKey, passwordHash, zb.id]
+    );
+    return { ok: true, zb, user: ins.rows[0], isNew: false };
+  }
+
+  const existingEmail = await db.query(
+    `SELECT id, full_name, username, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled
+     FROM zb_simple_users
+     WHERE lower(trim(coalesce(email, ''))) = $1 OR lower(trim(username)) = $1
+     LIMIT 1`,
+    [em]
+  );
+
+  if (existingEmail.rows.length) {
+    const zb = existingEmail.rows[0];
+    try {
+      await db.query(`UPDATE zb_simple_users SET google_sub = $1 WHERE id = $2::uuid AND (google_sub IS NULL OR google_sub = '')`, [
+        sub,
+        zb.id,
+      ]);
+    } catch (e) {
+      if (e.code !== '42703') throw e;
+    }
+    const lookupUserKey = String(zb.username).trim().toLowerCase();
+    let userResult = await db.query(
+      `SELECT user_id, username, name, role FROM users WHERE lower(trim(username)) = $1 AND is_active = true`,
+      [lookupUserKey]
+    );
+    let user;
+    if (userResult.rows.length) {
+      user = userResult.rows[0];
+      await db.query(`UPDATE users SET zb_profile_id = COALESCE(zb_profile_id, $1::uuid) WHERE user_id = $2`, [
+        zb.id,
+        user.user_id,
+      ]);
+    } else {
+      const displayName = (zb.full_name && String(zb.full_name).trim()) || name;
+      const passwordHash = await hashPassword(crypto.randomBytes(24).toString('hex'));
+      const ins = await db.query(
+        `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+         VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+         RETURNING user_id, username, name, role`,
+        [displayName, lookupUserKey, passwordHash, zb.id]
+      );
+      user = ins.rows[0];
+    }
+    return { ok: true, zb, user, isNew: false };
+  }
+
+  const client = await db.getClient();
+  const randomSecret = crypto.randomBytes(32).toString('hex');
+  try {
+    await client.query('BEGIN');
+    let zbRow;
+    await client.query('SAVEPOINT sp_google_zb');
+    try {
+      const ins = await client.query(
+        `INSERT INTO zb_simple_users (username, full_name, email, password_hash, google_sub)
+         VALUES ($1, $2, $3, crypt($4::text, gen_salt('bf'::text)), $5)
+         RETURNING id, username, full_name, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled`,
+        [em, name, em, randomSecret, sub]
+      );
+      zbRow = ins.rows[0];
+      await client.query('RELEASE SAVEPOINT sp_google_zb');
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_google_zb');
+      if (e.code !== '42703') throw e;
+      const ins = await client.query(
+        `INSERT INTO zb_simple_users (username, full_name, email, password_hash)
+         VALUES ($1, $2, $3, crypt($4::text, gen_salt('bf'::text)))
+         RETURNING id, username, full_name, email, COALESCE(mfa_email_enabled, false) AS mfa_email_enabled`,
+        [em, name, em, randomSecret]
+      );
+      zbRow = ins.rows[0];
+    }
+
+    await insertProfileWithFallbacks(client, {
+      zbId: zbRow.id,
+      displayName: name,
+      userRole: 'administrator',
+      planRaw: 'trial',
+    });
+
+    const passwordHash = await hashPassword(randomSecret);
+    const userIns = await client.query(
+      `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
+       VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+       RETURNING user_id, username, name, role`,
+      [name, em, passwordHash, zbRow.id]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true, zb: zbRow, user: userIns.rows[0], isNew: true };
+  } catch (e) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {
+      /* ignore */
+    }
+    if (e.code === '23505') {
+      return {
+        ok: false,
+        status: 409,
+        body: { error: 'Account already exists', message: 'Use email/password sign-in or try again.' },
+      };
+    }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * MFA / new-device checks → session or OTP challenge (shared by password + Google login).
+ */
+async function beginZbApiSession(req, { zb, user }) {
+  const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
+  const ipAddress = req.ip || req.connection.remoteAddress;
+  const userAgent = req.get('user-agent');
+
+  if (zb.mfa_email_enabled) {
+    const em =
+      normalizeEmail(zb.email) ||
+      String(zb.username || '')
+        .trim()
+        .toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: 'Two-factor is enabled but this account has no valid email on file.',
+        },
+      };
+    }
+    try {
+      await issueEmailOtp(req, em, 'login');
+    } catch (e) {
+      if (e.code === 'OTP_RATE_LIMIT') {
+        return { ok: false, status: 429, body: { error: 'Too many requests. Try again later.' } };
+      }
+      throw e;
+    }
+    return {
+      ok: true,
+      requiresOtp: true,
+      otpKind: 'mfa',
+      emailHint: maskEmailHint(em),
+      zb,
+      user,
+    };
+  }
+
+  const zbEmail =
+    normalizeEmail(zb.email) ||
+    String(zb.username || '')
+      .trim()
+      .toLowerCase();
+  const trusted = await isDeviceTrusted(user.user_id, deviceId);
+  if (!trusted) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(zbEmail)) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: 'Security check requires a valid email on your account.',
+        },
+      };
+    }
+    try {
+      await issueEmailOtp(req, zbEmail, 'new_device');
+    } catch (e) {
+      if (e.code === 'OTP_RATE_LIMIT') {
+        return { ok: false, status: 429, body: { error: 'Too many requests. Try again later.' } };
+      }
+      throw e;
+    }
+    return {
+      ok: true,
+      requiresOtp: true,
+      otpKind: 'new_device',
+      emailHint: maskEmailHint(zbEmail),
+      zb,
+      user,
+    };
+  }
+
+  const sessionId = await finalizeZbSimpleAuthSession(req, {
+    user,
+    zb,
+    deviceId,
+    ipAddress,
+    userAgent,
+  });
+
+  return {
+    ok: true,
+    sessionId,
+    user: {
+      user_id: user.user_id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+    },
+    zb,
+  };
 }
 
 async function attachExistingUserToInvitedShop(invite) {
@@ -880,89 +1206,126 @@ router.post('/login', async (req, res) => {
 });
 
 /**
- * POST /api/auth/zb-simple-session
- * Zentrya web login uses public.zb_simple_users (pgcrypto). HisaabKitab API routes use users + user_sessions.
- * Verifies the same username/password against zb_simple_users, finds or creates a users row, returns sessionId.
+ * POST /api/auth/google
+ * Sign in with Google (GIS id_token). Does not change email/password login.
  */
-router.post('/zb-simple-session', async (req, res) => {
+router.post('/google', async (req, res) => {
   try {
-    const { username, password } = req.body || {};
+    if (!getGoogleClientId()) {
+      return res.status(503).json({
+        error: 'Google sign-in not configured',
+        message: 'Set GOOGLE_OAUTH_CLIENT_ID on the backend (same Web client ID as frontend).',
+      });
+    }
+
+    const credential = req.body?.credential || req.body?.id_token;
+    const googleUser = await verifyGoogleIdToken(credential);
+    const resolved = await resolveOrCreateZbGoogleUser({
+      email: googleUser.email,
+      googleSub: googleUser.sub,
+      fullName: googleUser.name,
+    });
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
+    }
+
+    const { zb, user, isNew } = resolved;
+    const flow = await beginZbApiSession(req, { zb, user });
+    if (!flow.ok) {
+      return res.status(flow.status).json(flow.body);
+    }
+
+    const em = normalizeEmail(zb.email) || String(zb.username || '').trim().toLowerCase();
+
+    if (flow.requiresOtp) {
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        otpKind: flow.otpKind,
+        emailHint: flow.emailHint,
+        authMethod: 'google',
+        user_id: zb.id,
+        username: zb.username,
+        full_name: zb.full_name,
+        email: em,
+        isNewAccount: Boolean(isNew),
+      });
+    }
+
+    return res.json({
+      success: true,
+      sessionId: flow.sessionId,
+      user: flow.user,
+      authMethod: 'google',
+      user_id: zb.id,
+      username: zb.username,
+      full_name: zb.full_name,
+      email: em,
+      isNewAccount: Boolean(isNew),
+    });
+  } catch (error) {
+    console.error('[Auth Route] google sign-in error:', error);
+    const code = error.code;
+    if (code === 'GOOGLE_NOT_CONFIGURED') {
+      return res.status(503).json({ error: error.message });
+    }
+    if (code === 'INVALID_TOKEN' || code === 'NO_EMAIL' || code === 'EMAIL_NOT_VERIFIED') {
+      return res.status(401).json({ error: error.message });
+    }
+    res.status(500).json({
+      error: 'Google sign-in failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+});
+
+/**
+ * POST /api/auth/google/verify-otp
+ * Complete Google sign-in after MFA or new-device email code (no password).
+ */
+router.post('/google/verify-otp', async (req, res) => {
+  try {
+    const { email, otp, otpKind } = req.body || {};
     const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
     const ipAddress = req.ip || req.connection.remoteAddress;
     const userAgent = req.get('user-agent');
 
-    const resolved = await resolveZbSimpleLogin(username, password);
+    const resolved = await resolveZbByEmail(email);
     if (!resolved.ok) {
       return res.status(resolved.status).json(resolved.body);
     }
     const { zb, user } = resolved;
 
-    if (zb.mfa_email_enabled) {
-      const em =
-        normalizeEmail(zb.email) ||
-        String(zb.username || '')
-          .trim()
-          .toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
-        return res.status(409).json({
-          error: 'Two-factor is enabled but this account has no valid email on file.',
-          message: 'Ask an administrator to fix your account email, or restore access another way.',
-        });
-      }
-      try {
-        await issueEmailOtp(req, em, 'login');
-      } catch (e) {
-        if (e.code === 'OTP_RATE_LIMIT') {
-          return res.status(429).json({ error: 'Too many requests. Try again later.' });
-        }
-        console.error('[Auth Route] zb-simple-session MFA OTP:', e);
-        return res.status(500).json({
-          error: 'Failed to send login code',
-          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
-        });
-      }
-
-      return res.json({
-        success: true,
-        requiresOtp: true,
-        otpKind: 'mfa',
-        emailHint: maskEmailHint(em),
-      });
-    }
-
-    const zbEmail =
+    const em =
       normalizeEmail(zb.email) ||
       String(zb.username || '')
         .trim()
         .toLowerCase();
-    const trusted = await isDeviceTrusted(user.user_id, deviceId);
-    if (!trusted) {
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(zbEmail)) {
-        return res.status(409).json({
-          error: 'Security check requires a valid email on your account.',
-          message:
-            'This browser is not recognized. A verification code is sent by email — add a valid email to your account or contact support.',
-        });
-      }
-      try {
-        await issueEmailOtp(req, zbEmail, 'new_device');
-      } catch (e) {
-        if (e.code === 'OTP_RATE_LIMIT') {
-          return res.status(429).json({ error: 'Too many requests. Try again later.' });
-        }
-        console.error('[Auth Route] zb-simple-session new_device OTP:', e);
-        return res.status(500).json({
-          error: 'Failed to send security code',
-          message: process.env.NODE_ENV === 'development' ? e.message : undefined,
-        });
-      }
-      return res.json({
-        success: true,
-        requiresOtp: true,
-        otpKind: 'new_device',
-        emailHint: maskEmailHint(zbEmail),
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+      return res.status(400).json({ error: 'Invalid account email for OTP verification' });
+    }
+
+    const otpKindNorm = String(otpKind || '')
+      .trim()
+      .toLowerCase();
+    let purpose;
+    if (zb.mfa_email_enabled) {
+      purpose = 'login';
+    } else if (otpKindNorm === 'new_device') {
+      purpose = 'new_device';
+    } else {
+      return res.status(400).json({
+        error: 'Invalid verification request',
+        message: 'Use the security code sent to your email.',
       });
     }
+
+    const otpCode = String(otp || '').trim();
+    const otpCheck = await validateEmailOtpMatch(em, otpCode, purpose);
+    if (!otpCheck.ok) {
+      return res.status(400).json({ error: otpCheck.error || 'Invalid code' });
+    }
+    await markEmailOtpConsumed(otpCheck.rowId);
 
     const sessionId = await finalizeZbSimpleAuthSession(req, {
       user,
@@ -981,6 +1344,83 @@ router.post('/zb-simple-session', async (req, res) => {
         name: user.name,
         role: user.role,
       },
+      user_id: zb.id,
+      username: zb.username,
+      full_name: zb.full_name,
+      email: em,
+    });
+  } catch (error) {
+    console.error('[Auth Route] google/verify-otp error:', error);
+    res.status(500).json({
+      error: 'Session failed',
+      message: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+});
+
+/**
+ * POST /api/auth/google/resend-otp
+ * Resend MFA or new-device code during Google sign-in (no password).
+ */
+router.post('/google/resend-otp', async (req, res) => {
+  try {
+    const em = normalizeEmail(req.body?.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+    const resolved = await resolveZbByEmail(em);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
+    }
+    const { zb } = resolved;
+    const purpose = zb.mfa_email_enabled ? 'login' : 'new_device';
+    await issueEmailOtp(req, em, purpose);
+    return res.json({
+      success: true,
+      otpKind: zb.mfa_email_enabled ? 'mfa' : 'new_device',
+      emailHint: maskEmailHint(em),
+    });
+  } catch (e) {
+    if (e.code === 'OTP_RATE_LIMIT') {
+      return res.status(429).json({ error: 'Too many requests. Try again later.' });
+    }
+    console.error('[Auth Route] google/resend-otp:', e);
+    return res.status(500).json({ error: 'Could not resend code' });
+  }
+});
+
+/**
+ * POST /api/auth/zb-simple-session
+ * Zentrya web login uses public.zb_simple_users (pgcrypto). HisaabKitab API routes use users + user_sessions.
+ * Verifies the same username/password against zb_simple_users, finds or creates a users row, returns sessionId.
+ */
+router.post('/zb-simple-session', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+
+    const resolved = await resolveZbSimpleLogin(username, password);
+    if (!resolved.ok) {
+      return res.status(resolved.status).json(resolved.body);
+    }
+    const { zb, user } = resolved;
+
+    const flow = await beginZbApiSession(req, { zb, user });
+    if (!flow.ok) {
+      return res.status(flow.status).json(flow.body);
+    }
+    if (flow.requiresOtp) {
+      return res.json({
+        success: true,
+        requiresOtp: true,
+        otpKind: flow.otpKind,
+        emailHint: flow.emailHint,
+      });
+    }
+
+    res.json({
+      success: true,
+      sessionId: flow.sessionId,
+      user: flow.user,
     });
   } catch (error) {
     console.error('[Auth Route] zb-simple-session error:', error);
