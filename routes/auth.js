@@ -139,22 +139,37 @@ function maskEmailHint(emailRaw) {
 
 /** After password (+ optional OTP), create session, trust device, audit log, login alert email. */
 async function finalizeZbSimpleAuthSession(req, { user, zb, deviceId, ipAddress, userAgent }) {
-  await addTrustedDevice(user.user_id, deviceId);
   const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
-  await logLogin(user.user_id, ipAddress, userAgent, true);
+  await Promise.all([addTrustedDevice(user.user_id, deviceId), logLogin(user.user_id, ipAddress, userAgent, true)]);
   const em =
     normalizeEmail(zb.email) ||
     String(zb.username || '')
       .trim()
       .toLowerCase();
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) {
-    await sendLoginAlertEmail(req, {
+    sendLoginAlertEmail(req, {
       to: em,
       displayName: user.name,
       userId: user.user_id,
+    }).catch((e) => {
+      console.warn('[Auth Route] login alert email:', e.message);
     });
   }
   return sessionId;
+}
+
+function buildZbAuthPayload(zb) {
+  const email =
+    normalizeEmail(zb.email) ||
+    String(zb.username || '')
+      .trim()
+      .toLowerCase();
+  return {
+    user_id: zb.id,
+    username: zb.username,
+    full_name: zb.full_name,
+    email,
+  };
 }
 
 /**
@@ -1414,6 +1429,7 @@ router.post('/zb-simple-session', async (req, res) => {
         requiresOtp: true,
         otpKind: flow.otpKind,
         emailHint: flow.emailHint,
+        ...buildZbAuthPayload(zb),
       });
     }
 
@@ -1421,6 +1437,7 @@ router.post('/zb-simple-session', async (req, res) => {
       success: true,
       sessionId: flow.sessionId,
       user: flow.user,
+      ...buildZbAuthPayload(zb),
     });
   } catch (error) {
     console.error('[Auth Route] zb-simple-session error:', error);
