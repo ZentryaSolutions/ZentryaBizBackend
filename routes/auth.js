@@ -36,6 +36,10 @@ const { isDeviceTrusted, addTrustedDevice } = require('../utils/trustedDevices')
 const { consumeLogoutAllToken } = require('../utils/emailSecurityTokens');
 const { sendLoginAlertEmail, getFrontendBaseUrl } = require('../utils/loginAlertEmail');
 const { verifyGoogleIdToken, getGoogleClientId } = require('../utils/googleIdToken');
+const {
+  refreshPlanLifecycleForProfile,
+  maybeSendPlanRenewalReminder,
+} = require('../utils/planLifecycle');
 const crypto = require('crypto');
 
 function coercePlanForInsert(plan) {
@@ -89,11 +93,25 @@ async function insertProfileWithFallbacks(client, { zbId, displayName, userRole,
   const shopLimit = shopLimitForPlan(planStr);
   try {
     await client.query(
-      `UPDATE public.profiles SET shop_limit = $2 WHERE id = $1::uuid`,
-      [zbId, shopLimit]
+      `UPDATE public.profiles
+          SET shop_limit = $2,
+              trial_started_at = CASE
+                WHEN $3::text = 'trial' THEN COALESCE(trial_started_at, now())
+                ELSE trial_started_at
+              END,
+              trial_ends_at = CASE
+                WHEN $3::text = 'trial' THEN COALESCE(trial_ends_at, now() + interval '14 days')
+                ELSE trial_ends_at
+              END
+        WHERE id = $1::uuid`,
+      [zbId, shopLimit, planStr]
     );
   } catch (e) {
-    if (!/shop_limit/i.test(String(e.message || ''))) throw e;
+    if (/trial_started_at|trial_ends_at/i.test(String(e.message || ''))) {
+      await client.query(`UPDATE public.profiles SET shop_limit = $2 WHERE id = $1::uuid`, [zbId, shopLimit]);
+    } else if (!/shop_limit/i.test(String(e.message || ''))) {
+      throw e;
+    }
   }
 }
 
@@ -158,7 +176,7 @@ async function finalizeZbSimpleAuthSession(req, { user, zb, deviceId, ipAddress,
   return sessionId;
 }
 
-function buildZbAuthPayload(zb) {
+function buildZbAuthPayload(zb, planStatus = null) {
   const email =
     normalizeEmail(zb.email) ||
     String(zb.username || '')
@@ -169,6 +187,9 @@ function buildZbAuthPayload(zb) {
     username: zb.username,
     full_name: zb.full_name,
     email,
+    plan: planStatus?.plan || null,
+    trial_ends_at: planStatus?.trial_ends_at || null,
+    stripe_current_period_end: planStatus?.stripe_current_period_end || null,
   };
 }
 
@@ -528,6 +549,17 @@ async function beginZbApiSession(req, { zb, user }) {
   const deviceId = req.headers['x-device-id'] || deviceFingerprint.getDeviceId();
   const ipAddress = req.ip || req.connection.remoteAddress;
   const userAgent = req.get('user-agent');
+  let planStatus = null;
+  try {
+    planStatus = await refreshPlanLifecycleForProfile(zb.id);
+    if (planStatus && String(planStatus.plan || '').toLowerCase() !== 'trial') {
+      maybeSendPlanRenewalReminder(zb.id).catch((e) => {
+        console.warn('[Auth Route] plan renewal reminder:', e.message);
+      });
+    }
+  } catch (e) {
+    console.warn('[Auth Route] plan lifecycle:', e.message);
+  }
 
   if (zb.mfa_email_enabled) {
     const em =
@@ -559,6 +591,7 @@ async function beginZbApiSession(req, { zb, user }) {
       emailHint: maskEmailHint(em),
       zb,
       user,
+      planStatus,
     };
   }
 
@@ -593,6 +626,7 @@ async function beginZbApiSession(req, { zb, user }) {
       emailHint: maskEmailHint(zbEmail),
       zb,
       user,
+      planStatus,
     };
   }
 
@@ -614,6 +648,7 @@ async function beginZbApiSession(req, { zb, user }) {
       role: user.role,
     },
     zb,
+    planStatus,
   };
 }
 
@@ -1250,8 +1285,6 @@ router.post('/google', async (req, res) => {
       return res.status(flow.status).json(flow.body);
     }
 
-    const em = normalizeEmail(zb.email) || String(zb.username || '').trim().toLowerCase();
-
     if (flow.requiresOtp) {
       return res.json({
         success: true,
@@ -1259,11 +1292,8 @@ router.post('/google', async (req, res) => {
         otpKind: flow.otpKind,
         emailHint: flow.emailHint,
         authMethod: 'google',
-        user_id: zb.id,
-        username: zb.username,
-        full_name: zb.full_name,
-        email: em,
         isNewAccount: Boolean(isNew),
+        ...buildZbAuthPayload(zb, flow.planStatus),
       });
     }
 
@@ -1272,11 +1302,8 @@ router.post('/google', async (req, res) => {
       sessionId: flow.sessionId,
       user: flow.user,
       authMethod: 'google',
-      user_id: zb.id,
-      username: zb.username,
-      full_name: zb.full_name,
-      email: em,
       isNewAccount: Boolean(isNew),
+      ...buildZbAuthPayload(zb, flow.planStatus),
     });
   } catch (error) {
     console.error('[Auth Route] google sign-in error:', error);
@@ -1406,7 +1433,7 @@ router.post('/google/resend-otp', async (req, res) => {
 
 /**
  * POST /api/auth/zb-simple-session
- * Zentrya web login uses public.zb_simple_users (pgcrypto). HisaabKitab API routes use users + user_sessions.
+ * Zentrya web login uses public.zb_simple_users (pgcrypto). Legacy LAN API routes use users + user_sessions.
  * Verifies the same username/password against zb_simple_users, finds or creates a users row, returns sessionId.
  */
 router.post('/zb-simple-session', async (req, res) => {
@@ -1429,7 +1456,7 @@ router.post('/zb-simple-session', async (req, res) => {
         requiresOtp: true,
         otpKind: flow.otpKind,
         emailHint: flow.emailHint,
-        ...buildZbAuthPayload(zb),
+        ...buildZbAuthPayload(zb, flow.planStatus),
       });
     }
 
@@ -1437,7 +1464,7 @@ router.post('/zb-simple-session', async (req, res) => {
       success: true,
       sessionId: flow.sessionId,
       user: flow.user,
-      ...buildZbAuthPayload(zb),
+      ...buildZbAuthPayload(zb, flow.planStatus),
     });
   } catch (error) {
     console.error('[Auth Route] zb-simple-session error:', error);

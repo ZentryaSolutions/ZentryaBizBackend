@@ -133,7 +133,7 @@ async function bootstrap() {
   }
 
   const server = app.listen(PORT, HOST, () => {
-    console.log(`\n[Backend] ✅ HisaabKitab Backend Server running on http://${HOST}:${PORT}`);
+    console.log(`\n[Backend] ✅ Zentrya Biz API running on http://${HOST}:${PORT}`);
     console.log(`[Backend] Mode: ${readOnlyMode ? 'Read-Only (Client PC)' : 'Full Access (Server PC)'}`);
     console.log(`[Backend] Database: ${dbReady ? '✅ Connected' : '❌ Not configured or unreachable'}`);
     if (!readOnlyMode && HOST === '0.0.0.0') {
@@ -189,7 +189,7 @@ async function initializeRuntimeOnce() {
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    message: 'HisaabKitab API is running',
+    message: 'Zentrya Biz API is running',
     mode: readOnlyMode ? 'read-only' : 'full-access',
     timestamp: new Date().toISOString()
   });

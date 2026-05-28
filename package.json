@@ -1,7 +1,7 @@
 {
-  "name": "hisaabkitab-backend",
+  "name": "zentrya-biz-backend",
   "version": "1.0.0",
-  "description": "Backend API for HisaabKitab POS",
+  "description": "Backend API for Zentrya Biz",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

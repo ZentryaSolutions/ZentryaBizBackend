@@ -396,7 +396,7 @@ function isElevatedRole(role) {
 }
 
 /**
- * PUT /settings: allow HisaabKitab-style admin roles OR Zentrya shop owner/admin from shop_users.
+ * PUT /settings: allow legacy admin roles OR Zentrya shop owner/admin from shop_users.
  * Covers users whose `users.role` is still `cashier` but they own the shop in shop_users.
  */
 async function requireSettingsAdminOrShopOwner(req, res, next) {

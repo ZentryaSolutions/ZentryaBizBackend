@@ -16,5 +16,11 @@
       "src": "/(.*)",
       "dest": "server.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/billing/send-renewal-reminders",
+      "schedule": "0 9 * * *"
+    }
   ]
 }

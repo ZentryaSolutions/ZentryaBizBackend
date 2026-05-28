@@ -4,6 +4,7 @@
  */
 
 const db = require('../db');
+const { refreshPlanLifecycleForProfile } = require('../utils/planLifecycle');
 
 function planRank(plan) {
   const p = String(plan || '').toLowerCase();
@@ -16,13 +17,16 @@ function planRank(plan) {
 
 async function getPlanForUser(userId) {
   const r = await db.query(
-    `SELECT p.plan::text AS plan
+    `SELECT p.id::text AS profile_id, p.plan::text AS plan
      FROM users u
      JOIN public.profiles p ON p.id = u.zb_profile_id
      WHERE u.user_id = $1 AND u.is_active = true`,
     [userId]
   );
-  return r.rows[0]?.plan ?? null;
+  const row = r.rows[0];
+  if (!row) return null;
+  const status = await refreshPlanLifecycleForProfile(row.profile_id);
+  return status?.plan ?? row.plan ?? null;
 }
 
 function requirePlanMin(minRank) {

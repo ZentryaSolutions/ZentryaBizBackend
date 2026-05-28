@@ -4,6 +4,7 @@
  */
 
 const db = require('../db');
+const { getShopPlanAccess } = require('../utils/planLifecycle');
 
 function parseShopUuid(headerVal) {
   if (!headerVal || typeof headerVal !== 'string') return null;
@@ -47,6 +48,11 @@ async function requireShopContext(req, res, next) {
         error: 'Shop access denied',
         message: 'You are not a member of this shop.',
       });
+    }
+
+    const planAccess = await getShopPlanAccess(shopId);
+    if (!planAccess.ok) {
+      return res.status(planAccess.status || 402).json(planAccess.body);
     }
 
     req.shopId = shopId;

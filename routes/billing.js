@@ -3,6 +3,7 @@ const router = express.Router();
 const Stripe = require('stripe');
 const db = require('../db');
 const { syncSubscriptionForUserId } = require('../utils/stripePlanSync');
+const { sendDuePlanRenewalReminders } = require('../utils/planLifecycle');
 
 function getStripe() {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -142,6 +143,30 @@ router.post('/sync-subscription', async (req, res) => {
     return res.status(status).json({
       error: e.message || 'Failed to sync subscription',
     });
+  }
+});
+
+function verifyCronSecret(req, res, next) {
+  const secret = String(process.env.CRON_SECRET || '').trim();
+  if (!secret) return next();
+  const auth = String(req.headers.authorization || '').trim();
+  const bearer = auth.replace(/^Bearer\s+/i, '');
+  const header = String(req.headers['x-cron-secret'] || '').trim();
+  if (bearer === secret || header === secret) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+/**
+ * Vercel Cron: daily paid-plan renewal reminders.
+ * Sends once per Stripe billing period when renewal is within the reminder window.
+ */
+router.get('/send-renewal-reminders', verifyCronSecret, async (_req, res) => {
+  try {
+    const result = await sendDuePlanRenewalReminders();
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[Billing] send-renewal-reminders error:', e);
+    return res.status(500).json({ error: e.message || 'Failed to send renewal reminders' });
   }
 });
 
