@@ -158,7 +158,14 @@ function maskEmailHint(emailRaw) {
 /** After password (+ optional OTP), create session, trust device, audit log, login alert email. */
 async function finalizeZbSimpleAuthSession(req, { user, zb, deviceId, ipAddress, userAgent }) {
   const sessionId = await createSession(user.user_id, deviceId, ipAddress, userAgent);
-  await Promise.all([addTrustedDevice(user.user_id, deviceId), logLogin(user.user_id, ipAddress, userAgent, true)]);
+  await Promise.all([
+    addTrustedDevice(user.user_id, deviceId),
+    logLogin(user.user_id, ipAddress, userAgent, true, {
+      shopId: user.shop_id || null,
+      userName: user.name || user.username,
+      method: 'email',
+    }),
+  ]);
   const em =
     normalizeEmail(zb.email) ||
     String(zb.username || '')
@@ -1162,7 +1169,7 @@ router.post('/login', async (req, res) => {
     // PIN login (for cashier)
     if (pin && !username) {
       if (!/^\d{4}$/.test(pin)) {
-        await logLogin(null, ipAddress, userAgent, false);
+        await logLogin(null, ipAddress, userAgent, false, { method: 'PIN', attemptedUser: 'invalid PIN format' });
         return res.status(400).json({
           error: 'Invalid PIN',
           message: 'PIN must be exactly 4 digits'
@@ -1682,7 +1689,10 @@ router.post('/logout', requireAuth, async (req, res) => {
     const userAgent = req.get('user-agent');
 
     await destroySession(sessionId);
-    await logLogout(req.user.user_id, ipAddress, userAgent);
+    await logLogout(req.user.user_id, ipAddress, userAgent, {
+      shopId: req.shopId || req.user?.shop_id || null,
+      userName: req.user?.name || req.user?.username,
+    });
 
     res.json({
       success: true,

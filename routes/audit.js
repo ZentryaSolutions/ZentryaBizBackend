@@ -84,6 +84,8 @@ function buildFilters(req) {
       OR COALESCE(u.name, '') ILIKE $${n}
       OR COALESCE(al.table_name, '') ILIKE $${n}
       OR COALESCE(al.action, '') ILIKE $${n}
+      OR COALESCE(al.old_values::text, '') ILIKE $${n}
+      OR COALESCE(al.new_values::text, '') ILIKE $${n}
     )`;
     params.push(`%${String(search).trim()}%`);
     n++;

@@ -131,28 +131,55 @@ function getTableNameFromPath(path) {
 }
 
 /**
- * Log user login
+ * Log user login / sign-in (shop-scoped when shopId provided).
+ * @param {object} [options] — { shopId, userName, method, attemptedUser }
  */
-async function logLogin(userId, ipAddress, userAgent, success = true) {
+async function logLogin(userId, ipAddress, userAgent, success = true, options = {}) {
+  const {
+    shopId = null,
+    userName = null,
+    method = null,
+    attemptedUser = null,
+  } = options;
+
+  const methodLabel = method ? String(method) : null;
+  let notes;
+  if (success) {
+    const who = userName || (userId ? `User #${userId}` : 'User');
+    notes = methodLabel ? `${who} signed in (${methodLabel})` : `${who} signed in`;
+  } else {
+    const attempt = attemptedUser ? ` for "${attemptedUser}"` : '';
+    notes = methodLabel
+      ? `Failed sign-in (${methodLabel})${attempt}`
+      : `Failed sign-in attempt${attempt}`;
+  }
+
   await logAuditEvent({
     userId: success ? userId : null,
+    shopId,
     action: success ? 'login' : 'login_failed',
-    notes: success ? 'User logged in successfully' : 'Failed login attempt',
+    tableName: 'auth',
+    notes,
+    newValues: success && userName ? { user_name: userName, method: methodLabel } : null,
     ipAddress,
-    userAgent
+    userAgent,
   });
 }
 
 /**
  * Log user logout
  */
-async function logLogout(userId, ipAddress, userAgent) {
+async function logLogout(userId, ipAddress, userAgent, options = {}) {
+  const { shopId = null, userName = null } = options;
+  const who = userName || (userId ? `User #${userId}` : 'User');
   await logAuditEvent({
     userId,
+    shopId,
     action: 'logout',
-    notes: 'User logged out',
+    tableName: 'auth',
+    notes: `${who} signed out`,
     ipAddress,
-    userAgent
+    userAgent,
   });
 }
 

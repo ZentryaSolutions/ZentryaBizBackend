@@ -3,7 +3,13 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
-const { auditFromReq, pickFields } = require('../lib/auditTrail');
+const {
+  auditFromReq,
+  normalizeProductAudit,
+  buildProductChangeNotes,
+  buildProductCreateNotes,
+  buildProductDeleteNotes,
+} = require('../lib/auditTrail');
 
 // All product routes require authentication (both admins and cashiers can view products)
 router.use(requireAuth);
@@ -297,12 +303,13 @@ router.post('/', async (req, res) => {
     );
 
     const created = productResult.rows[0];
+    const createdSnap = normalizeProductAudit(created);
     await auditFromReq(req, {
       action: 'create',
       tableName: 'products',
       recordId: created.product_id,
-      newValues: pickFields(created, ['product_id', 'item_name_english', 'sku', 'purchase_price', 'retail_price', 'quantity_in_stock']),
-      notes: `Created product ${created.item_name_english || created.name}`,
+      newValues: createdSnap,
+      notes: buildProductCreateNotes(created),
     });
 
     res.status(201).json(created);
@@ -403,35 +410,19 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    // Fetch product with supplier name
-    const productResult = await db.query(
-      `SELECT 
-        p.product_id,
-        p.name,
-        p.sku,
-        p.category,
-        p.purchase_price,
-        p.selling_price,
-        p.quantity_in_stock,
-        p.supplier_id,
-        s.name as supplier_name
-      FROM products p
-      LEFT JOIN suppliers s ON p.supplier_id = s.supplier_id AND s.shop_id = $2
-      WHERE p.product_id = $1 AND p.shop_id = $2`,
-      [id, shopId]
-    );
-
-    const updated = productResult.rows[0];
+    const updatedRow = result.rows[0];
+    const oldSnap = normalizeProductAudit(existing);
+    const newSnap = normalizeProductAudit(updatedRow);
     await auditFromReq(req, {
       action: 'update',
       tableName: 'products',
       recordId: parseInt(id, 10),
-      oldValues: pickFields(existing, ['purchase_price', 'retail_price', 'quantity_in_stock', 'item_name_english']),
-      newValues: pickFields(updated, ['purchase_price', 'selling_price', 'quantity_in_stock', 'item_name_english']),
-      notes: `Updated product ${englishName.trim()}`,
+      oldValues: oldSnap,
+      newValues: newSnap,
+      notes: buildProductChangeNotes(oldSnap, newSnap),
     });
 
-    res.json(updated);
+    res.json(updatedRow);
   } catch (error) {
     console.error('Error updating product:', error);
     if (error.code === '23505') { // Unique constraint violation
@@ -447,6 +438,20 @@ router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     const shopId = req.shopId;
     
+    const existingResult = await db.query(
+      `SELECT product_id, item_name_english, name, sku, purchase_price, retail_price,
+              selling_price, wholesale_price, special_price, quantity_in_stock
+       FROM products WHERE product_id = $1 AND shop_id = $2`,
+      [id, shopId]
+    );
+
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const existingProduct = existingResult.rows[0];
+    const oldSnap = normalizeProductAudit(existingProduct);
+
     const result = await db.query(
       'DELETE FROM products WHERE product_id = $1 AND shop_id = $2 RETURNING product_id',
       [id, shopId]
@@ -460,7 +465,8 @@ router.delete('/:id', async (req, res) => {
       action: 'delete',
       tableName: 'products',
       recordId: parseInt(id, 10),
-      notes: `Deleted product #${id}`,
+      oldValues: oldSnap,
+      notes: buildProductDeleteNotes(existingProduct),
     });
 
     res.json({ message: 'Product deleted successfully', product_id: id });
@@ -559,6 +565,14 @@ router.post('/import-bulk', async (req, res) => {
       created += 1;
     }
     await client.query('COMMIT');
+    if (created > 0) {
+      await auditFromReq(req, {
+        action: 'create',
+        tableName: 'products',
+        newValues: { import_count: created },
+        notes: `Imported ${created} product(s) from spreadsheet`,
+      });
+    }
     res.status(201).json({ ok: true, created, preview });
   } catch (e) {
     await client.query('ROLLBACK');
