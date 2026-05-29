@@ -6,6 +6,7 @@ const { requireAuth, requireRole, isElevatedRole } = require('../middleware/auth
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
 const { logSensitiveAccess } = require('../utils/auditLogger');
 const { requireProPlan } = require('../middleware/planMiddleware');
+const { saleSignFactor, lineNetRevenueSql, lineCogsSql } = require('../utils/profitCalculations');
 
 // All report routes require authentication and active shop (x-shop-id)
 router.use(requireAuth);
@@ -499,19 +500,31 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
       params.push(startYmd, endYmd);
     }
 
-    // Get Sales totals
+    const sign = saleSignFactor('s');
+
+    // Get Sales totals (signed — returns reduce revenue)
     const salesQuery = `
       SELECT 
-        COALESCE(SUM(total_amount), 0) as total_sales,
-        COUNT(*) as invoice_count,
-        COALESCE(SUM(CASE WHEN payment_type = 'cash' THEN total_amount ELSE 0 END), 0) as cash_sales,
-        COALESCE(SUM(CASE WHEN payment_type IN ('credit', 'split') THEN total_amount ELSE 0 END), 0) as credit_sales,
-        COALESCE(SUM(paid_amount), 0) as cash_received
-      FROM sales
-      ${dateWhereSales}
+        COALESCE(SUM(${sign} * s.total_amount), 0) as total_sales,
+        COUNT(*) FILTER (WHERE COALESCE(s.sale_kind, 'sale') <> 'return' AND s.invoice_number NOT ILIKE 'CN-%') as invoice_count,
+        COALESCE(SUM(CASE WHEN s.payment_type = 'cash' THEN ${sign} * s.total_amount ELSE 0 END), 0) as cash_sales,
+        COALESCE(SUM(CASE WHEN s.payment_type IN ('credit', 'split') THEN ${sign} * s.total_amount ELSE 0 END), 0) as credit_sales,
+        COALESCE(SUM(${sign} * s.paid_amount), 0) as cash_received
+      FROM sales s
+      ${dateWhereSales.replace(/^WHERE shop_id/, 'WHERE s.shop_id').replace(/ AND date /g, ' AND s.date ')}
     `;
 
-    // Get Purchases totals (purchases.total_amount is the bill total)
+    const cogsQuery = `
+      SELECT COALESCE(SUM(
+        ${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity
+      ), 0) AS total_cogs
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      LEFT JOIN products p ON p.product_id = si.product_id AND p.shop_id = s.shop_id
+      ${dateWhereSales.replace(/^WHERE shop_id/, 'WHERE s.shop_id').replace(/ AND date /g, ' AND s.date ')}
+    `;
+
+    // Purchases (inventory bought — informational; not used in net profit)
     const purchasesQuery = `
       SELECT 
         COALESCE(SUM(p.total_amount), 0) as total_purchases
@@ -591,6 +604,7 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
     const lowStockParams = [sid];
     const [
       salesResult,
+      cogsResult,
       purchasesResult,
       expensesResult,
       creditResult,
@@ -600,6 +614,7 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
       lowStockTopResult,
     ] = await Promise.all([
       db.query(salesQuery, params),
+      db.query(cogsQuery, params),
       db.query(purchasesQuery, params),
       db.query(expensesQuery, params),
       db.query(creditQuery, creditParams),
@@ -610,9 +625,11 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
     ]);
 
     const totalSales = parseFloat(salesResult.rows[0].total_sales) || 0;
+    const totalCogs = parseFloat(cogsResult.rows[0].total_cogs) || 0;
     const totalPurchases = parseFloat(purchasesResult.rows[0].total_purchases) || 0;
     const totalExpenses = parseFloat(expensesResult.rows[0].total_expenses) || 0;
-    const netProfit = totalSales - totalPurchases - totalExpenses;
+    const grossProfit = totalSales - totalCogs;
+    const netProfit = totalSales - totalCogs - totalExpenses;
     const cashReceived = parseFloat(salesResult.rows[0].cash_received) || 0;
     const creditGiven = parseFloat(creditResult.rows[0].total_credit_given) || 0;
 
@@ -637,9 +654,12 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
 
     res.json({
       totalSales,
+      totalCogs,
+      grossProfit,
       totalPurchases,
       totalExpenses,
       netProfit,
+      profitFormula: 'netProfit = totalSales - totalCogs - totalExpenses',
       cashReceived,
       creditGiven,
       invoiceCount: parseInt(salesResult.rows[0].invoice_count) || 0,
@@ -969,29 +989,82 @@ router.get('/sales-by-product', requireRole('administrator'), requireProPlan, as
       paramIndex++;
     }
 
+    const sign = saleSignFactor('s');
+    const lineRev = lineNetRevenueSql('si');
+    const lineCogs = lineCogsSql('si', 'p');
+    const expenseDateFilter =
+      startDate && endDate ? ' AND e.expense_date >= $2 AND e.expense_date <= $3' : '';
+
     const query = `
       SELECT 
         p.product_id,
         COALESCE(p.item_name_english, p.name) as product_name,
-        SUM(si.quantity) as quantity_sold,
-        COALESCE(SUM(si.quantity * si.selling_price), 0) as total_sale_amount
-      FROM sale_items si
-      JOIN sales s ON si.sale_id = s.sale_id
-      JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
-      WHERE s.shop_id = $1 ${dateWhere} ${productFilter}
-      GROUP BY p.product_id, p.item_name_english, p.name
+        COALESCE(SUM(${sign} * si.quantity), 0) as quantity_sold,
+        COALESCE(SUM(${sign} * ${lineRev}), 0) as total_sale_amount,
+        COALESCE(SUM(${sign} * COALESCE(si.line_discount, 0)), 0) as total_discount,
+        COALESCE(SUM(${sign} * ${lineCogs}), 0) as total_cost,
+        COALESCE(pe.product_expense, 0) as total_expense
+      FROM products p
+      LEFT JOIN sale_items si ON si.product_id = p.product_id
+      LEFT JOIN sales s ON si.sale_id = s.sale_id AND s.shop_id = p.shop_id ${dateWhere}
+      LEFT JOIN (
+        SELECT a.product_id, SUM(a.amount) AS product_expense
+        FROM expense_product_allocations a
+        JOIN daily_expenses e ON e.expense_id = a.expense_id AND e.shop_id = a.shop_id
+        WHERE a.shop_id = $1 ${expenseDateFilter}
+        GROUP BY a.product_id
+      ) pe ON pe.product_id = p.product_id
+      WHERE p.shop_id = $1 ${productFilter.replace('si.product_id', 'p.product_id')}
+      GROUP BY p.product_id, p.item_name_english, p.name, pe.product_expense
+      HAVING COALESCE(SUM(${sign} * ${lineRev}), 0) <> 0
+        OR COALESCE(pe.product_expense, 0) <> 0
       ORDER BY total_sale_amount DESC
     `;
 
-    const result = await db.query(query, params);
-    
+    let result;
+    try {
+      result = await db.query(query, params);
+    } catch (err) {
+      if (err.code !== '42P01' && err.code !== '42703') throw err;
+      const grossRev = `COALESCE(SUM(${sign} * si.quantity * si.selling_price), 0)`;
+      const fallbackQ = `
+        SELECT 
+          p.product_id,
+          COALESCE(p.item_name_english, p.name) as product_name,
+          COALESCE(SUM(${sign} * si.quantity), 0) as quantity_sold,
+          ${grossRev} as total_sale_amount,
+          0::float as total_discount,
+          COALESCE(SUM(${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity), 0) as total_cost,
+          0::float as total_expense
+        FROM sale_items si
+        JOIN sales s ON si.sale_id = s.sale_id
+        JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
+        WHERE s.shop_id = $1 ${dateWhere} ${productFilter}
+        GROUP BY p.product_id, p.item_name_english, p.name
+        ORDER BY total_sale_amount DESC
+      `;
+      result = await db.query(fallbackQ, params);
+    }
+
     res.json({
-      products: result.rows.map(row => ({
-        product_id: row.product_id,
-        product_name: row.product_name,
-        quantity_sold: parseFloat(row.quantity_sold) || 0,
-        total_sale_amount: parseFloat(row.total_sale_amount) || 0
-      })),
+      products: result.rows.map((row) => {
+        const revenue = parseFloat(row.total_sale_amount) || 0;
+        const cost = parseFloat(row.total_cost) || 0;
+        const expense = parseFloat(row.total_expense) || 0;
+        const grossProfit = revenue - cost;
+        const netProfit = revenue - cost - expense;
+        return {
+          product_id: row.product_id,
+          product_name: row.product_name,
+          quantity_sold: parseFloat(row.quantity_sold) || 0,
+          total_sale_amount: revenue,
+          total_discount: parseFloat(row.total_discount) || 0,
+          total_cost: cost,
+          total_expense: expense,
+          gross_profit: grossProfit,
+          net_profit: netProfit,
+        };
+      }),
       dateRange: {
         start: startDate ? startDate.toISOString() : null,
         end: endDate ? endDate.toISOString() : null
@@ -1024,33 +1097,41 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
     const params = [sid];
     let paramIndex = 2;
 
-    let salesWhere = 'WHERE shop_id = $1';
+    let salesWhereAliased = 'WHERE s.shop_id = $1';
     let purchasesWhere = 'WHERE p.shop_id = $1';
     let expensesWhere = 'WHERE shop_id = $1';
 
     if (startDate && endDate) {
-      salesWhere += ` AND date >= $${paramIndex} AND date <= $${paramIndex + 1}`;
+      salesWhereAliased += ` AND s.date >= $${paramIndex} AND s.date <= $${paramIndex + 1}`;
       purchasesWhere += ` AND p.date >= $${paramIndex} AND p.date <= $${paramIndex + 1}`;
       expensesWhere += ` AND expense_date >= $${paramIndex} AND expense_date <= $${paramIndex + 1}`;
       params.push(startDate, endDate);
       paramIndex += 2;
     }
 
-    // Get Sales
+    const sign = saleSignFactor('s');
+
     const salesQuery = `
-      SELECT COALESCE(SUM(total_amount), 0) as total_sales
-      FROM sales
-      ${salesWhere}
+      SELECT COALESCE(SUM(${sign} * s.total_amount), 0) as total_sales
+      FROM sales s
+      ${salesWhereAliased}
+    `;
+    const cogsQuery = `
+      SELECT COALESCE(SUM(
+        ${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity
+      ), 0) AS total_cogs
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      LEFT JOIN products p ON p.product_id = si.product_id AND p.shop_id = s.shop_id
+      ${salesWhereAliased}
     `;
 
-    // Get Purchases
     const purchasesQuery = `
       SELECT COALESCE(SUM(p.total_amount), 0) as total_purchases
       FROM purchases p
       ${purchasesWhere}
     `;
 
-    // Get Expenses
     const expensesQuery = `
       SELECT COALESCE(SUM(amount), 0) as total_expenses
       FROM daily_expenses
@@ -1058,10 +1139,22 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
     `;
 
     const salesDailyQ = `
-      SELECT (date::date) AS d, COALESCE(SUM(total_amount), 0)::float AS rev
-      FROM sales ${salesWhere}
-      GROUP BY (date::date)
-      ORDER BY (date::date) ASC
+      SELECT (s.date::date) AS d, COALESCE(SUM(${sign} * s.total_amount), 0)::float AS rev
+      FROM sales s
+      ${salesWhereAliased}
+      GROUP BY (s.date::date)
+      ORDER BY (s.date::date) ASC
+    `;
+
+    const cogsDailyQ = `
+      SELECT (s.date::date) AS d,
+        COALESCE(SUM(${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity), 0)::float AS cogs
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      LEFT JOIN products p ON p.product_id = si.product_id AND p.shop_id = s.shop_id
+      ${salesWhereAliased}
+      GROUP BY (s.date::date)
+      ORDER BY (s.date::date) ASC
     `;
     const purchDailyQ = `
       SELECT (p.date::date) AS d, COALESCE(SUM(p.total_amount), 0)::float AS amt
@@ -1085,27 +1178,32 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
 
     const [
       salesResult,
+      cogsResult,
       purchasesResult,
       expensesResult,
       salesDailyR,
+      cogsDailyR,
       purchDailyR,
       expDailyR,
       expCatR,
     ] = await Promise.all([
       db.query(salesQuery, params),
+      db.query(cogsQuery, params),
       db.query(purchasesQuery, params),
       db.query(expensesQuery, params),
       db.query(salesDailyQ, params),
+      db.query(cogsDailyQ, params),
       db.query(purchDailyQ, params),
       db.query(expDailyQ, params),
       db.query(expCatQ, params),
     ]);
 
     const totalSales = parseFloat(salesResult.rows[0].total_sales) || 0;
+    const totalCogs = parseFloat(cogsResult.rows[0].total_cogs) || 0;
     const totalPurchases = parseFloat(purchasesResult.rows[0].total_purchases) || 0;
     const totalExpenses = parseFloat(expensesResult.rows[0].total_expenses) || 0;
-    const netProfit = totalSales - totalPurchases - totalExpenses;
-    const grossProfit = totalSales - totalPurchases;
+    const grossProfit = totalSales - totalCogs;
+    const netProfit = totalSales - totalCogs - totalExpenses;
     const netMarginPct = totalSales > 0 ? Math.round((netProfit / totalSales) * 1000) / 10 : 0;
     const expenseRatioPct = totalSales > 0 ? Math.round((totalExpenses / totalSales) * 1000) / 10 : 0;
 
@@ -1114,23 +1212,23 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
       const k = ymdFromPgDate(row.d);
       revMap[k] = parseFloat(row.rev) || 0;
     });
-    const purchMap = {};
-    purchDailyR.rows.forEach((row) => {
+    const cogsMap = {};
+    cogsDailyR.rows.forEach((row) => {
       const k = ymdFromPgDate(row.d);
-      purchMap[k] = parseFloat(row.amt) || 0;
+      cogsMap[k] = parseFloat(row.cogs) || 0;
     });
     const expMap = {};
     expDailyR.rows.forEach((row) => {
       const k = ymdFromPgDate(row.d);
       expMap[k] = parseFloat(row.amt) || 0;
     });
-    const allDays = new Set([...Object.keys(revMap), ...Object.keys(purchMap), ...Object.keys(expMap)]);
+    const allDays = new Set([...Object.keys(revMap), ...Object.keys(cogsMap), ...Object.keys(expMap)]);
     const profitTrend = [...allDays].sort().map((d) => {
       const rev = revMap[d] || 0;
-      const pc = purchMap[d] || 0;
+      const cogs = cogsMap[d] || 0;
       const ex = expMap[d] || 0;
-      const costs = pc + ex;
-      return { date: d, revenue: rev, costs, net: rev - costs };
+      const costs = cogs + ex;
+      return { date: d, revenue: rev, costs, cogs, expenses: ex, net: rev - costs };
     });
 
     const expenseCategoryBreakdown = expCatR.rows.map((row) => ({
@@ -1140,6 +1238,7 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
 
     res.json({
       totalSales,
+      totalCogs,
       totalPurchases,
       totalExpenses,
       netProfit,
@@ -1148,6 +1247,7 @@ router.get('/profit', requireRole('administrator'), async (req, res) => {
       expenseRatioPct,
       profitTrend,
       expenseCategoryBreakdown,
+      profitFormula: 'netProfit = totalSales - totalCogs - totalExpenses',
       dateRange: {
         start: startDate ? startDate.toISOString() : null,
         end: endDate ? endDate.toISOString() : null
@@ -1722,22 +1822,35 @@ router.get('/dashboard', async (req, res) => {
       }
     }
 
+    const sign = saleSignFactor('s');
+
     const todaySalesQuery = `
       SELECT 
-        COALESCE(SUM(total_amount), 0) as today_sale,
-        COUNT(*)::int as bill_count
+        COALESCE(SUM(${sign} * total_amount), 0) as today_sale,
+        COUNT(*) FILTER (WHERE COALESCE(sale_kind, 'sale') <> 'return' AND invoice_number NOT ILIKE 'CN-%')::int as bill_count
       FROM sales
       WHERE date = $1::date AND shop_id = $2
     `;
 
-    const todayProfitQuery = isAdmin ? `
-      SELECT 
-        COALESCE(SUM((si.selling_price - COALESCE(p.purchase_price, 0)) * si.quantity), 0) as today_profit
+    const todayCogsQuery = isAdmin
+      ? `
+      SELECT COALESCE(SUM(
+        ${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity
+      ), 0) AS today_cogs
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.sale_id
       LEFT JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
       WHERE s.date = $1::date AND s.shop_id = $2
-    ` : null;
+    `
+      : null;
+
+    const todayExpensesQuery = isAdmin
+      ? `
+      SELECT COALESCE(SUM(amount), 0) AS today_expenses
+      FROM daily_expenses
+      WHERE expense_date = $1::date AND shop_id = $2
+    `
+      : null;
 
     const todayCollectedQuery = `
       SELECT COALESCE(SUM(paid_amount), 0) AS collected_today
@@ -1868,10 +1981,12 @@ router.get('/dashboard', async (req, res) => {
       GROUP BY e.expense_date
     `;
 
-    const weekProfitQuery = isAdmin
+    const lineRevDash = lineNetRevenueSql('si');
+    const lineCogsDash = lineCogsSql('si', 'p');
+    const weekGrossProfitQuery = isAdmin
       ? `
       SELECT s.date::date AS d,
-        COALESCE(SUM((si.selling_price - COALESCE(p.purchase_price, 0)) * si.quantity), 0)::float AS profit
+        COALESCE(SUM(${sign} * (${lineRevDash} - ${lineCogsDash})), 0)::float AS gross_profit
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.sale_id
       LEFT JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
@@ -1882,10 +1997,20 @@ router.get('/dashboard', async (req, res) => {
 
     const monthSalesAggQuery = `
       SELECT 
-        COALESCE(SUM(total_amount), 0)::float AS total_sales,
-        COALESCE(SUM(paid_amount), 0)::float AS cash_collected
+        COALESCE(SUM(${sign} * total_amount), 0)::float AS total_sales,
+        COALESCE(SUM(${sign} * paid_amount), 0)::float AS cash_collected
       FROM sales
       WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+    `;
+
+    const monthCogsQuery = `
+      SELECT COALESCE(SUM(
+        ${sign} * COALESCE(si.purchase_price, p.purchase_price, 0) * si.quantity
+      ), 0)::float AS total_cogs
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.sale_id
+      LEFT JOIN products p ON p.product_id = si.product_id AND p.shop_id = s.shop_id
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
     `;
 
     const monthPurchQuery = `
@@ -1927,7 +2052,8 @@ router.get('/dashboard', async (req, res) => {
 
     const queries = [
       db.query(todaySalesQuery, dayParam),
-      isAdmin ? db.query(todayProfitQuery, dayParam) : Promise.resolve({ rows: [{ today_profit: 0 }] }),
+      isAdmin ? db.query(todayCogsQuery, dayParam) : Promise.resolve({ rows: [{ today_cogs: 0 }] }),
+      isAdmin ? db.query(todayExpensesQuery, dayParam) : Promise.resolve({ rows: [{ today_expenses: 0 }] }),
       db.query(todayCashSalesQuery, dayParam),
       db.query(customerPaymentsQuery, dayParam),
       isAdmin ? db.query(supplierPaymentsQuery, dayParam) : Promise.resolve({ rows: [{ cash_paid: 0 }] }),
@@ -1940,8 +2066,9 @@ router.get('/dashboard', async (req, res) => {
       db.query(salesMonthQuery, dashRange),
       db.query(weekRevenueQuery, weekRange),
       db.query(weekExpensesQuery, weekRange),
-      isAdmin ? db.query(weekProfitQuery, weekRange) : Promise.resolve({ rows: [] }),
+      isAdmin ? db.query(weekGrossProfitQuery, weekRange) : Promise.resolve({ rows: [] }),
       db.query(monthSalesAggQuery, dashRange),
+      isAdmin ? db.query(monthCogsQuery, dashRange) : Promise.resolve({ rows: [{ total_cogs: 0 }] }),
       db.query(monthPurchQuery, dashRange),
       db.query(monthExpQuery, dashRange),
       db.query(monthUnitsSoldQuery, dashRange),
@@ -1951,7 +2078,8 @@ router.get('/dashboard', async (req, res) => {
 
     const [
       todaySalesResult,
-      todayProfitResult,
+      todayCogsResult,
+      todayExpensesResult,
       todayCashSalesResult,
       customerPaymentsResult,
       supplierPaymentsResult,
@@ -1964,8 +2092,9 @@ router.get('/dashboard', async (req, res) => {
       salesMonthResult,
       weekRevenueResult,
       weekExpensesResult,
-      weekProfitResult,
+      weekGrossProfitResult,
       monthSalesAggResult,
+      monthCogsResult,
       monthPurchResult,
       monthExpResult,
       monthUnitsSoldResult,
@@ -1983,7 +2112,9 @@ router.get('/dashboard', async (req, res) => {
 
     const todaySale = parseFloat(todaySalesResult.rows[0].today_sale) || 0;
     const todayBillCount = parseInt(todaySalesResult.rows[0].bill_count, 10) || 0;
-    const rawTodayProfit = isAdmin ? parseFloat(todayProfitResult.rows[0].today_profit) || 0 : null;
+    const todayCogs = isAdmin ? parseFloat(todayCogsResult.rows[0].today_cogs) || 0 : 0;
+    const todayExpenses = isAdmin ? parseFloat(todayExpensesResult.rows[0].today_expenses) || 0 : 0;
+    const rawTodayProfit = isAdmin ? todaySale - todayCogs - todayExpenses : null;
     const todayProfit = isAdmin ? rawTodayProfit : null;
     const todayCollected = parseFloat(todayCollectedResult.rows[0].collected_today) || 0;
     const todayProfitMarginPct =
@@ -2004,9 +2135,9 @@ router.get('/dashboard', async (req, res) => {
     weekExpensesResult.rows.forEach((r) => {
       expMap[ymdFromPgDate(r.d)] = parseFloat(r.amt) || 0;
     });
-    const profMap = {};
-    weekProfitResult.rows.forEach((r) => {
-      profMap[ymdFromPgDate(r.d)] = parseFloat(r.profit) || 0;
+    const grossProfMap = {};
+    weekGrossProfitResult.rows.forEach((r) => {
+      grossProfMap[ymdFromPgDate(r.d)] = parseFloat(r.gross_profit) || 0;
     });
 
     const weeklyTrend = {
@@ -2022,26 +2153,31 @@ router.get('/dashboard', async (req, res) => {
       days: dayKeys,
       revenue: dayKeys.map((d) => revMap[d] || 0),
       expenses: dayKeys.map((d) => expMap[d] || 0),
-      profit: isAdmin ? dayKeys.map((d) => profMap[d] || 0) : dayKeys.map(() => 0),
+      profit: isAdmin
+        ? dayKeys.map((d) => (grossProfMap[d] || 0) - (expMap[d] || 0))
+        : dayKeys.map(() => 0),
     };
 
     const totalSalesM = parseFloat(monthSalesAggResult.rows[0].total_sales) || 0;
     const cashCollectedM = parseFloat(monthSalesAggResult.rows[0].cash_collected) || 0;
+    const totalCogsM = isAdmin ? parseFloat(monthCogsResult.rows[0].total_cogs) || 0 : 0;
     const totalPurchasesM = parseFloat(monthPurchResult.rows[0].total_purchases) || 0;
     const totalExpensesM = parseFloat(monthExpResult.rows[0].total_expenses) || 0;
     const unitsSoldM = parseFloat(monthUnitsSoldResult.rows[0].units) || 0;
-    const netProfitMonth = isAdmin ? totalSalesM - totalPurchasesM - totalExpensesM : null;
+    const netProfitMonth = isAdmin ? totalSalesM - totalCogsM - totalExpensesM : null;
     const custDue = parseFloat(customerDueResult.rows[0].customer_due) || 0;
 
     const monthSnapshot = {
       label: dashPeriodLabel,
       netProfit: netProfitMonth,
+      totalCogs: totalCogsM,
       totalExpenses: totalExpensesM,
       creditOutstanding: custDue,
       cashCollected: cashCollectedM,
       totalSales: totalSalesM,
       totalPurchases: totalPurchasesM,
       unitsSold: unitsSoldM,
+      profitFormula: 'netProfit = totalSales - totalCogs - totalExpenses',
     };
 
     const lowStockPeekRow = lowStockPeekResult.rows[0];

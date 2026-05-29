@@ -236,6 +236,7 @@ app.use('/api/reports', require('./routes/reports'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/backup', require('./routes/backup'));
 app.use('/api/users', require('./routes/users'));
+app.use('/api/audit', require('./routes/audit'));
 app.use('/api/notifications', require('./routes/notifications').router);
 app.use('/api/updates', require('./routes/updates'));
 app.use('/api/billing', require('./routes/billing'));

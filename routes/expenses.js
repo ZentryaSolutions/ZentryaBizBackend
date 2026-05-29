@@ -3,6 +3,13 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, requireRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const {
+  parseAllocationsInput,
+  assertProductsInShop,
+  replaceAllocations,
+  attachAllocationsToRows,
+} = require('../lib/expenseAllocations');
+const { auditFromReq, pickFields } = require('../lib/auditTrail');
 
 /** Store <input type="date"> as plain YYYY-MM-DD — avoids JS Date UTC shift vs list filters */
 function expenseDateForDb(input) {
@@ -66,7 +73,8 @@ router.get('/', async (req, res) => {
     query += ' ORDER BY expense_date DESC, expense_id DESC';
 
     const result = await db.query(query, params);
-    res.json(result.rows);
+    const rows = await attachAllocationsToRows(db, result.rows);
+    res.json(rows);
   } catch (error) {
     console.error('Error fetching expenses:', error);
     res.status(500).json({ error: 'Failed to fetch expenses', message: error.message });
@@ -156,8 +164,9 @@ router.get('/:id', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Expense not found' });
     }
-    
-    res.json(result.rows[0]);
+
+    const [withAlloc] = await attachAllocationsToRows(db, result.rows);
+    res.json(withAlloc);
   } catch (error) {
     console.error('Error fetching expense:', error);
     res.status(500).json({ error: 'Failed to fetch expense', message: error.message });
@@ -173,7 +182,6 @@ router.post('/', async (req, res) => {
 
     const { expense_category, amount, expense_date, payment_method, notes } = req.body;
 
-    // Validation
     if (!expense_category || !expense_category.trim()) {
       throw new Error('Expense name is required');
     }
@@ -183,19 +191,58 @@ router.post('/', async (req, res) => {
       throw new Error('Amount must be greater than 0');
     }
 
+    const parsedAlloc = parseAllocationsInput(req.body, expenseAmount);
+    if (parsedAlloc.error) throw new Error(parsedAlloc.error);
+
     const expenseDate = expenseDateForDb(expense_date) || new Date().toISOString().slice(0, 10);
     const paymentMethod = payment_method || 'cash';
+    const expenseScope = parsedAlloc.scope;
 
-    const result = await client.query(
-      `INSERT INTO daily_expenses (expense_category, amount, expense_date, payment_method, notes, shop_id)
-       VALUES ($1, $2, $3::date, $4, $5, $6)
-       RETURNING *`,
-      [expense_category.trim(), expenseAmount, expenseDate, paymentMethod, notes || null, req.shopId]
-    );
+    if (parsedAlloc.lines.length) {
+      await assertProductsInShop(client, req.shopId, parsedAlloc.lines.map((l) => l.product_id));
+    }
+
+    const insertParams = [
+      expense_category.trim(),
+      expenseAmount,
+      expenseDate,
+      paymentMethod,
+      notes || null,
+      req.shopId,
+      expenseScope,
+    ];
+    let result;
+    try {
+      result = await client.query(
+        `INSERT INTO daily_expenses (expense_category, amount, expense_date, payment_method, notes, shop_id, expense_scope)
+         VALUES ($1, $2, $3::date, $4, $5, $6, $7)
+         RETURNING *`,
+        insertParams
+      );
+    } catch (insertErr) {
+      if (insertErr.code !== '42703') throw insertErr;
+      result = await client.query(
+        `INSERT INTO daily_expenses (expense_category, amount, expense_date, payment_method, notes, shop_id)
+         VALUES ($1, $2, $3::date, $4, $5, $6)
+         RETURNING *`,
+        insertParams.slice(0, 6)
+      );
+    }
+
+    const expenseId = result.rows[0].expense_id;
+    await replaceAllocations(client, expenseId, req.shopId, parsedAlloc.lines);
 
     await client.query('COMMIT');
 
-    res.status(201).json(result.rows[0]);
+    const [row] = await attachAllocationsToRows(db, result.rows);
+    await auditFromReq(req, {
+      action: 'create',
+      tableName: 'daily_expenses',
+      recordId: row.expense_id,
+      newValues: pickFields(row, ['expense_category', 'amount', 'expense_date', 'expense_scope']),
+      notes: `Expense: ${row.expense_category}`,
+    });
+    res.status(201).json(row);
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error creating expense:', error);
@@ -227,24 +274,64 @@ router.put('/:id', async (req, res) => {
       throw new Error('Amount must be greater than 0');
     }
 
+    const parsedAlloc = parseAllocationsInput(req.body, expenseAmount);
+    if (parsedAlloc.error) throw new Error(parsedAlloc.error);
+
     const expenseDate = expenseDateForDb(expense_date);
 
-    const result = await client.query(
-      `UPDATE daily_expenses 
-       SET expense_category = $1, amount = $2, expense_date = COALESCE($3::date, expense_date), 
-           payment_method = $4, notes = $5
-       WHERE expense_id = $6 AND shop_id = $7
-       RETURNING *`,
-      [expense_category.trim(), expenseAmount, expenseDate, payment_method || 'cash', notes || null, id, req.shopId]
-    );
+    if (parsedAlloc.lines.length) {
+      await assertProductsInShop(client, req.shopId, parsedAlloc.lines.map((l) => l.product_id));
+    }
+
+    const updateParams = [
+      expense_category.trim(),
+      expenseAmount,
+      expenseDate,
+      payment_method || 'cash',
+      notes || null,
+      parsedAlloc.scope,
+      id,
+      req.shopId,
+    ];
+    let result;
+    try {
+      result = await client.query(
+        `UPDATE daily_expenses 
+         SET expense_category = $1, amount = $2, expense_date = COALESCE($3::date, expense_date), 
+             payment_method = $4, notes = $5, expense_scope = $6
+         WHERE expense_id = $7 AND shop_id = $8
+         RETURNING *`,
+        updateParams
+      );
+    } catch (updateErr) {
+      if (updateErr.code !== '42703') throw updateErr;
+      result = await client.query(
+        `UPDATE daily_expenses 
+         SET expense_category = $1, amount = $2, expense_date = COALESCE($3::date, expense_date), 
+             payment_method = $4, notes = $5
+         WHERE expense_id = $6 AND shop_id = $7
+         RETURNING *`,
+        updateParams.filter((_, i) => i !== 5)
+      );
+    }
 
     if (result.rows.length === 0) {
       throw new Error('Expense not found');
     }
 
+    await replaceAllocations(client, result.rows[0].expense_id, req.shopId, parsedAlloc.lines);
+
     await client.query('COMMIT');
 
-    res.json(result.rows[0]);
+    const [row] = await attachAllocationsToRows(db, result.rows);
+    await auditFromReq(req, {
+      action: 'update',
+      tableName: 'daily_expenses',
+      recordId: row.expense_id,
+      newValues: pickFields(row, ['expense_category', 'amount', 'expense_date']),
+      notes: `Updated expense #${row.expense_id}`,
+    });
+    res.json(row);
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error updating expense:', error);
@@ -276,6 +363,13 @@ router.delete('/:id', async (req, res) => {
     }
 
     await client.query('COMMIT');
+
+    await auditFromReq(req, {
+      action: 'delete',
+      tableName: 'daily_expenses',
+      recordId: parseInt(id, 10),
+      notes: `Deleted expense #${id}`,
+    });
 
     res.json({ message: 'Expense deleted successfully', expense_id: id });
   } catch (error) {

@@ -4,7 +4,13 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, isElevatedRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
-const { logAuditEvent } = require('../utils/auditLogger');
+const { auditFromReq, pickFields } = require('../lib/auditTrail');
+const {
+  lineGross,
+  parseLineDiscount,
+  lineProfit,
+  insertSaleItemRow,
+} = require('../lib/saleLineMath');
 const notificationsModule = require('./notifications');
 const createNotification = notificationsModule.createNotification || (async () => {
   // Fallback if createNotification is not available
@@ -65,6 +71,12 @@ router.get('/', async (req, res) => {
         s.is_finalized,
         s.finalized_at,
         s.created_by,
+        s.sale_kind,
+        s.original_sale_id,
+        s.notes,
+        (SELECT o.invoice_number FROM sales o
+         WHERE o.sale_id = s.original_sale_id AND o.shop_id = s.shop_id
+         LIMIT 1) AS original_invoice_number,
         (SELECT COUNT(*)::int FROM sale_items si0 WHERE si0.sale_id = s.sale_id) AS item_count,
         (
           SELECT string_agg(sub2.nm, ', ')
@@ -143,7 +155,13 @@ router.get('/:id', async (req, res) => {
           s.is_finalized,
           s.finalized_at,
           s.created_by,
-          s.updated_by
+          s.updated_by,
+          s.sale_kind,
+          s.original_sale_id,
+          s.notes,
+          (SELECT o.invoice_number FROM sales o
+           WHERE o.sale_id = s.original_sale_id AND o.shop_id = s.shop_id
+           LIMIT 1) AS original_invoice_number
         FROM sales s
         LEFT JOIN customers c
           ON s.customer_id = c.customer_id
@@ -228,6 +246,8 @@ router.post('/', async (req, res) => {
     let subtotalAmount = 0;
     let totalProfit = 0;
 
+    const normalizedItems = [];
+
     for (const item of items) {
       const { product_id, quantity, selling_price } = item;
 
@@ -257,12 +277,27 @@ router.post('/', async (req, res) => {
       const q = parseFloat(quantity);
       qtyByProduct.set(pid, (qtyByProduct.get(pid) || 0) + q);
 
-      const purchasePrice = parseFloat(product.purchase_price);
-      const itemTotal = parseFloat(selling_price) * quantity;
-      const itemProfit = (parseFloat(selling_price) - purchasePrice) * quantity;
+      const purchasePrice = parseFloat(product.purchase_price) || 0;
+      const gross = lineGross(q, selling_price);
+      const lineDiscount = parseLineDiscount(item, gross);
+      const itemProfit = lineProfit(q, selling_price, purchasePrice, lineDiscount);
 
-      subtotalAmount += itemTotal;
+      subtotalAmount += gross;
       totalProfit += itemProfit;
+      normalizedItems.push({
+        product_id: pid,
+        quantity: q,
+        selling_price: parseFloat(selling_price),
+        purchase_price: purchasePrice,
+        line_discount: lineDiscount,
+        profit: itemProfit,
+      });
+    }
+
+    let totalLineDiscount = normalizedItems.reduce((s, it) => s + it.line_discount, 0);
+    const billDiscountExtra = Math.max(0, parseFloat(discount) || 0);
+    if (billDiscountExtra > totalLineDiscount + 0.02) {
+      totalLineDiscount = billDiscountExtra;
     }
 
     // Enforce stock: cannot sell more than on hand (total per product across all lines)
@@ -283,10 +318,11 @@ router.post('/', async (req, res) => {
     }
 
     // Calculate totals
-    const discountAmount = parseFloat(discount) || 0;
+    const discountAmount = Math.round(totalLineDiscount * 100) / 100;
     const taxAmount = parseFloat(tax) || 0;
     const subtotal = subtotalAmount;
-    const grandTotal = subtotal - discountAmount + taxAmount;
+    const grandTotal = Math.max(0, subtotal - discountAmount + taxAmount);
+    totalProfit = Math.round(totalProfit * 100) / 100;
     // Settlement type (cash | credit | split) must come from payment_type — NOT payment_mode
     // (payment_mode is cash/card/bank for how money was received; mixing them breaks udhar/split).
     const paidRaw = paid_amount !== undefined && paid_amount !== null ? parseFloat(paid_amount) : NaN;
@@ -344,31 +380,22 @@ router.post('/', async (req, res) => {
 
     const saleId = saleResult.rows[0].sale_id;
 
-    // Create sale items and update stock
-    for (const item of items) {
-      const { product_id, quantity, selling_price } = item;
+    for (const item of normalizedItems) {
+      await insertSaleItemRow(client, {
+        saleId,
+        productId: item.product_id,
+        quantity: item.quantity,
+        sellingPrice: item.selling_price,
+        purchasePrice: item.purchase_price,
+        profit: item.profit,
+        lineDiscount: item.line_discount,
+      });
 
-      // Get product purchase price
-      const productResult = await client.query(
-        'SELECT purchase_price FROM products WHERE product_id = $1 AND shop_id = $2',
-        [product_id, req.shopId]
-      );
-      const purchasePrice = parseFloat(productResult.rows[0].purchase_price);
-      const profit = (parseFloat(selling_price) - purchasePrice) * quantity;
-
-      // Insert sale item
-      await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, quantity, selling_price, purchase_price, profit)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [saleId, product_id, quantity, selling_price, purchasePrice, profit]
-      );
-
-      // Update product stock (allow negative stock for hardware shops)
       await client.query(
         `UPDATE products 
          SET quantity_in_stock = quantity_in_stock - $1
          WHERE product_id = $2 AND shop_id = $3`,
-        [quantity, product_id, req.shopId]
+        [item.quantity, item.product_id, req.shopId]
       );
     }
 
@@ -404,15 +431,19 @@ router.post('/', async (req, res) => {
     }
 
     // Log audit event
-    await logAuditEvent({
-      userId,
+    await auditFromReq(req, {
       action: 'create',
       tableName: 'sales',
       recordId: saleId,
-      newValues: { invoice_number: invoiceNumber, total_amount: grandTotal },
+      newValues: {
+        invoice_number: invoiceNumber,
+        total_amount: grandTotal,
+        discount: discountAmount,
+        items: normalizedItems.map((it) =>
+          pickFields(it, ['product_id', 'quantity', 'selling_price', 'line_discount'])
+        ),
+      },
       notes: `Created invoice ${invoiceNumber}`,
-      ipAddress: req.ip || req.connection.remoteAddress,
-      userAgent: req.get('user-agent')
     });
 
     // Fetch complete sale with items for response
@@ -622,15 +653,12 @@ router.put('/:id', async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Log audit event
-    await logAuditEvent({
-      userId,
+    await auditFromReq(req, {
       action: 'update',
       tableName: 'sales',
-      recordId: parseInt(id),
+      recordId: parseInt(id, 10),
       notes: `Updated invoice ${sale.invoice_number}`,
-      ipAddress: req.ip || req.connection.remoteAddress,
-      userAgent: req.get('user-agent')
+      newValues: pickFields(sale, ['invoice_number', 'total_amount', 'discount']),
     });
 
     // Fetch updated sale
@@ -739,16 +767,12 @@ router.delete('/:id', async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Log audit event
-    await logAuditEvent({
-      userId,
+    await auditFromReq(req, {
       action: 'delete',
       tableName: 'sales',
-      recordId: parseInt(id),
-      oldValues: { invoice_number: sale.invoice_number, total_amount: sale.total_amount },
+      recordId: parseInt(id, 10),
+      oldValues: pickFields(sale, ['invoice_number', 'total_amount', 'customer_id']),
       notes: `Deleted invoice ${sale.invoice_number}`,
-      ipAddress: req.ip || req.connection.remoteAddress,
-      userAgent: req.get('user-agent')
     });
 
     res.json({
@@ -865,9 +889,17 @@ async function generateCreditNoteNumber(shopId, client) {
   return 'CN-00001';
 }
 
+function buildReturnNotes(originalInvoice, returnReason) {
+  const reason = String(returnReason || '')
+    .trim()
+    .replace(/\|/g, '-')
+    .slice(0, 500);
+  return `REF:${originalInvoice} | REASON:${reason}`;
+}
+
 /**
  * Return / refund — creates credit note, restores stock, adjusts customer balance.
- * Body: { items: [{ product_id, quantity }], refund_type: 'cash'|'credit' }
+ * Body: { items: [{ product_id, quantity }], refund_type: 'cash'|'credit', return_reason: string (required) }
  */
 router.post('/:id/return', async (req, res) => {
   const client = await db.getClient();
@@ -880,6 +912,11 @@ router.post('/:id/return', async (req, res) => {
     const returnItems = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!returnItems.length) {
       return res.status(400).json({ error: 'Select at least one item to return' });
+    }
+
+    const returnReason = String(req.body?.return_reason || '').trim();
+    if (returnReason.length < 3) {
+      return res.status(400).json({ error: 'Return reason is required (at least 3 characters).' });
     }
 
     const refundType = String(req.body?.refund_type || 'cash').toLowerCase() === 'credit' ? 'credit' : 'cash';
@@ -900,16 +937,35 @@ router.post('/:id/return', async (req, res) => {
       return res.status(400).json({ error: 'Cannot return a credit note' });
     }
 
-    const origItemsRes = await client.query(
-      `SELECT sale_item_id, product_id, quantity, selling_price, purchase_price
-       FROM sale_items WHERE sale_id = $1`,
-      [originalId]
-    );
+    let origItemsRes;
+    await client.query('SAVEPOINT sp_orig_items');
+    try {
+      origItemsRes = await client.query(
+        `SELECT sale_item_id, product_id, quantity, selling_price, purchase_price, line_discount
+         FROM sale_items WHERE sale_id = $1`,
+        [originalId]
+      );
+      await client.query('RELEASE SAVEPOINT sp_orig_items');
+    } catch (e) {
+      await client.query('ROLLBACK TO SAVEPOINT sp_orig_items');
+      if (e.code !== '42703') throw e;
+      origItemsRes = await client.query(
+        `SELECT sale_item_id, product_id, quantity, selling_price, purchase_price
+         FROM sale_items WHERE sale_id = $1`,
+        [originalId]
+      );
+    }
     const origByProduct = new Map();
     origItemsRes.rows.forEach((row) => {
       const pid = parseInt(row.product_id, 10);
-      const prev = origByProduct.get(pid) || { qty: 0, selling_price: row.selling_price, purchase_price: row.purchase_price };
+      const prev = origByProduct.get(pid) || {
+        qty: 0,
+        selling_price: row.selling_price,
+        purchase_price: row.purchase_price,
+        line_discount_total: 0,
+      };
       prev.qty += parseFloat(row.quantity) || 0;
+      prev.line_discount_total += parseFloat(row.line_discount) || 0;
       origByProduct.set(pid, prev);
     });
 
@@ -952,16 +1008,26 @@ router.post('/:id/return', async (req, res) => {
 
       const sp = parseFloat(line.selling_price) || parseFloat(orig.selling_price) || 0;
       const pp = parseFloat(orig.purchase_price) || 0;
-      subtotalReturn += sp * qty;
-      totalProfitReturn += (sp - pp) * qty;
-      linesToInsert.push({ product_id: pid, quantity: qty, selling_price: sp, purchase_price: pp });
+      const discPerUnit = orig.qty > 0 ? (orig.line_discount_total || 0) / orig.qty : 0;
+      const lineDisc = Math.round(discPerUnit * qty * 100) / 100;
+      const gross = sp * qty;
+      subtotalReturn += gross;
+      totalProfitReturn += gross - lineDisc - pp * qty;
+      linesToInsert.push({
+        product_id: pid,
+        quantity: qty,
+        selling_price: sp,
+        purchase_price: pp,
+        line_discount: lineDisc,
+      });
     }
 
     if (!linesToInsert.length) {
       throw new Error('No valid return lines');
     }
 
-    const grandTotal = subtotalReturn;
+    const returnLineDiscount = linesToInsert.reduce((s, l) => s + (l.line_discount || 0), 0);
+    const grandTotal = Math.max(0, subtotalReturn - returnLineDiscount);
     let paymentType = 'cash';
     let paidAmount = grandTotal;
     if (refundType === 'credit' && original.customer_id) {
@@ -975,14 +1041,14 @@ router.post('/:id/return', async (req, res) => {
     const creditNoteNumber = await generateCreditNoteNumber(req.shopId, client);
     const userId = req.user?.user_id || null;
     const saleBusinessDate = await getBusinessTodayDateString(client);
-    const returnNotes = `REF:${original.invoice_number}`;
+    const returnNotes = buildReturnNotes(original.invoice_number, returnReason);
 
     const baseNoNotes = [
       creditNoteNumber,
       original.customer_id || null,
       original.customer_name || null,
       subtotalReturn,
-      0,
+      returnLineDiscount,
       0,
       grandTotal,
       paidAmount,
@@ -1004,12 +1070,21 @@ router.post('/:id/return', async (req, res) => {
     const returnSaleId = saleResult.rows[0].sale_id;
 
     for (const line of linesToInsert) {
-      const profit = (line.selling_price - line.purchase_price) * line.quantity;
-      await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, quantity, selling_price, purchase_price, profit)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [returnSaleId, line.product_id, line.quantity, line.selling_price, line.purchase_price, profit]
+      const profit = lineProfit(
+        line.quantity,
+        line.selling_price,
+        line.purchase_price,
+        line.line_discount || 0
       );
+      await insertSaleItemRow(client, {
+        saleId: returnSaleId,
+        productId: line.product_id,
+        quantity: line.quantity,
+        sellingPrice: line.selling_price,
+        purchasePrice: line.purchase_price,
+        profit,
+        lineDiscount: line.line_discount || 0,
+      });
       await client.query(
         `UPDATE products SET quantity_in_stock = quantity_in_stock + $1
          WHERE product_id = $2 AND shop_id = $3`,
@@ -1033,6 +1108,19 @@ router.post('/:id/return', async (req, res) => {
 
     await client.query('COMMIT');
 
+    await auditFromReq(req, {
+      action: 'create',
+      tableName: 'sales',
+      recordId: returnSaleId,
+      newValues: {
+        invoice_number: creditNoteNumber,
+        original_invoice: original.invoice_number,
+        return_reason: returnReason,
+        total_amount: grandTotal,
+      },
+      notes: `Sales return ${creditNoteNumber} for ${original.invoice_number}`,
+    });
+
     const detail = await db.query(
       `SELECT s.*, (
          SELECT json_agg(json_build_object(
@@ -1054,7 +1142,8 @@ router.post('/:id/return', async (req, res) => {
       refund_type: refundType,
       refund_cash_amount: refundType === 'cash' ? grandTotal : 0,
       original_invoice: original.invoice_number,
-      message: 'Return recorded as credit note',
+      return_reason: returnReason,
+      message: 'Sales return recorded',
     });
   } catch (error) {
     try {
@@ -1105,15 +1194,11 @@ router.post('/:id/finalize', async (req, res) => {
       [userId, id, req.shopId]
     );
 
-    // Log audit event
-    await logAuditEvent({
-      userId,
+    await auditFromReq(req, {
       action: 'finalize',
       tableName: 'sales',
-      recordId: parseInt(id),
-      notes: `Finalized invoice`,
-      ipAddress: req.ip || req.connection.remoteAddress,
-      userAgent: req.get('user-agent')
+      recordId: parseInt(id, 10),
+      notes: 'Finalized invoice',
     });
 
     res.json({

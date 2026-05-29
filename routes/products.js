@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const { auditFromReq, pickFields } = require('../lib/auditTrail');
 
 // All product routes require authentication (both admins and cashiers can view products)
 router.use(requireAuth);
@@ -295,7 +296,16 @@ router.post('/', async (req, res) => {
       [result.rows[0].product_id, shopId]
     );
 
-    res.status(201).json(productResult.rows[0]);
+    const created = productResult.rows[0];
+    await auditFromReq(req, {
+      action: 'create',
+      tableName: 'products',
+      recordId: created.product_id,
+      newValues: pickFields(created, ['product_id', 'item_name_english', 'sku', 'purchase_price', 'retail_price', 'quantity_in_stock']),
+      notes: `Created product ${created.item_name_english || created.name}`,
+    });
+
+    res.status(201).json(created);
   } catch (error) {
     console.error('Error creating product:', error);
     if (error.code === '23505') { // Unique constraint violation
@@ -411,7 +421,17 @@ router.put('/:id', async (req, res) => {
       [id, shopId]
     );
 
-    res.json(productResult.rows[0]);
+    const updated = productResult.rows[0];
+    await auditFromReq(req, {
+      action: 'update',
+      tableName: 'products',
+      recordId: parseInt(id, 10),
+      oldValues: pickFields(existing, ['purchase_price', 'retail_price', 'quantity_in_stock', 'item_name_english']),
+      newValues: pickFields(updated, ['purchase_price', 'selling_price', 'quantity_in_stock', 'item_name_english']),
+      notes: `Updated product ${englishName.trim()}`,
+    });
+
+    res.json(updated);
   } catch (error) {
     console.error('Error updating product:', error);
     if (error.code === '23505') { // Unique constraint violation
@@ -435,6 +455,13 @@ router.delete('/:id', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
+
+    await auditFromReq(req, {
+      action: 'delete',
+      tableName: 'products',
+      recordId: parseInt(id, 10),
+      notes: `Deleted product #${id}`,
+    });
 
     res.json({ message: 'Product deleted successfully', product_id: id });
   } catch (error) {

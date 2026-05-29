@@ -20,6 +20,7 @@ const db = require('../db');
  */
 async function logAuditEvent({
   userId = null,
+  shopId = null,
   action,
   tableName = null,
   recordId = null,
@@ -27,27 +28,44 @@ async function logAuditEvent({
   newValues = null,
   ipAddress = null,
   userAgent = null,
-  notes = null
+  notes = null,
 }) {
+  const baseParams = [
+    userId,
+    action,
+    tableName,
+    recordId,
+    oldValues ? JSON.stringify(oldValues) : null,
+    newValues ? JSON.stringify(newValues) : null,
+    ipAddress,
+    userAgent,
+    notes,
+  ];
+
   try {
-    await db.query(`
-      INSERT INTO audit_logs (
-        user_id, action, table_name, record_id, 
-        old_values, new_values, ip_address, user_agent, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    `, [
-      userId,
-      action,
-      tableName,
-      recordId,
-      oldValues ? JSON.stringify(oldValues) : null,
-      newValues ? JSON.stringify(newValues) : null,
-      ipAddress,
-      userAgent,
-      notes
-    ]);
+    await db.query(
+      `INSERT INTO audit_logs (
+        user_id, action, table_name, record_id,
+        old_values, new_values, ip_address, user_agent, notes, shop_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [...baseParams, shopId]
+    );
   } catch (error) {
-    // Don't throw - audit logging should never break the application
+    if (error.code === '42703') {
+      try {
+        await db.query(
+          `INSERT INTO audit_logs (
+            user_id, action, table_name, record_id,
+            old_values, new_values, ip_address, user_agent, notes
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          baseParams
+        );
+        return;
+      } catch (fallbackErr) {
+        console.error('[Audit Log] Error logging audit event:', fallbackErr);
+        return;
+      }
+    }
     console.error('[Audit Log] Error logging audit event:', error);
   }
 }

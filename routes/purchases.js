@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, requireRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const { auditFromReq, pickFields } = require('../lib/auditTrail');
 
 // Purchases management is admin-only (cashiers cannot manage purchases)
 router.use(requireAuth);
@@ -226,9 +227,18 @@ router.post('/', async (req, res) => {
       )
     ]);
 
+    const purchaseRow = purchaseFinal.rows[0];
+    await auditFromReq(req, {
+      action: 'create',
+      tableName: 'purchases',
+      recordId: purchaseId,
+      newValues: pickFields(purchaseRow, ['purchase_id', 'total_amount', 'supplier_id', 'payment_type']),
+      notes: `Purchase #${purchaseId}`,
+    });
+
     res.status(201).json({
-      ...purchaseFinal.rows[0],
-      items: itemsResult.rows
+      ...purchaseRow,
+      items: itemsResult.rows,
     });
 
   } catch (error) {
@@ -288,6 +298,14 @@ router.delete('/:id', async (req, res) => {
     await client.query('DELETE FROM purchases WHERE purchase_id = $1 AND shop_id = $2', [id, req.shopId]);
 
     await client.query('COMMIT');
+
+    await auditFromReq(req, {
+      action: 'delete',
+      tableName: 'purchases',
+      recordId: parseInt(id, 10),
+      oldValues: pickFields(purchaseResult.rows[0], ['purchase_id', 'total_amount', 'supplier_id']),
+      notes: `Deleted purchase #${id}`,
+    });
 
     res.json({ message: 'Purchase deleted successfully', purchase_id: id });
 

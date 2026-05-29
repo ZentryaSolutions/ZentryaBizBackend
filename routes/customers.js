@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const { auditFromReq, pickFields } = require('../lib/auditTrail');
 
 router.use(requireAuth);
 router.use(requireShopContext);
@@ -372,8 +373,15 @@ router.post('/', async (req, res) => {
       [name.trim(), phone.trim(), address || null, openingBal, customerType, creditLimit, customerStatus, req.shopId]
     );
 
-    console.log('[Customers API] Customer created successfully:', result.rows[0]?.customer_id);
-    res.status(201).json(result.rows[0]);
+    const created = result.rows[0];
+    await auditFromReq(req, {
+      action: 'create',
+      tableName: 'customers',
+      recordId: created.customer_id,
+      newValues: pickFields(created, ['customer_id', 'name', 'phone', 'customer_type']),
+      notes: `Created customer ${created.name}`,
+    });
+    res.status(201).json(created);
   } catch (error) {
     console.error('[Customers API] Error creating customer:', error);
     console.error('[Customers API] Error details:', {
@@ -463,7 +471,15 @@ router.put('/:id', async (req, res) => {
       [id, req.shopId]
     );
 
-    res.json(updatedResult.rows[0]);
+    const updated = updatedResult.rows[0];
+    await auditFromReq(req, {
+      action: 'update',
+      tableName: 'customers',
+      recordId: parseInt(id, 10),
+      newValues: pickFields(updated, ['name', 'phone', 'opening_balance', 'customer_type', 'status']),
+      notes: `Updated customer ${updated.name}`,
+    });
+    res.json(updated);
   } catch (error) {
     console.error('Error updating customer:', error);
     res.status(500).json({ error: 'Failed to update customer', message: error.message });
@@ -497,6 +513,13 @@ router.delete('/:id', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Customer not found' });
     }
+
+    await auditFromReq(req, {
+      action: 'delete',
+      tableName: 'customers',
+      recordId: parseInt(id, 10),
+      notes: `Deleted customer #${id}`,
+    });
 
     res.json({ message: 'Customer deleted successfully', customer_id: id });
   } catch (error) {
