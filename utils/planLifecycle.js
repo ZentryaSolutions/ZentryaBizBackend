@@ -1,6 +1,7 @@
 const db = require('../db');
 const { shopLimitForPlan } = require('../lib/planShopLimits');
 const { sendTransactionalEmail } = require('./transactionalMail');
+const { DEFAULT_TZ } = require('./businessDate');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TRIAL_DAYS = 14;
@@ -35,18 +36,26 @@ function daysUntil(value) {
   return Math.max(0, Math.ceil((d - Date.now()) / DAY_MS));
 }
 
-/** UTC calendar day index (midnight UTC) for consistent trial day counting. */
-function utcDayIndex(value) {
+/** Calendar day index in business TZ (default Asia/Karachi — not UTC). */
+function businessDayIndex(value, timeZone = DEFAULT_TZ) {
   const d = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(d.getTime())) return null;
-  return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / DAY_MS);
+  const key = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+  const [y, m, day] = key.split('-').map((n) => parseInt(n, 10));
+  if (!y || !m || !day) return null;
+  return Math.floor(Date.UTC(y, m - 1, day) / DAY_MS);
 }
 
 /**
- * Trial progress from DB timestamps (matches profiles.trial_started_at / trial_ends_at).
- * Day 1 = calendar day of trial_started_at (UTC).
+ * Trial progress from DB timestamps (profiles.trial_started_at / trial_ends_at).
+ * Day 1 = first calendar day of trial in business timezone (Pakistan by default).
  */
-function computeTrialProgress(status) {
+function computeTrialProgress(status, timeZone = DEFAULT_TZ) {
   const plan = normalizePlan(status?.plan);
   if (plan !== 'trial') return null;
 
@@ -66,8 +75,8 @@ function computeTrialProgress(status) {
     };
   }
 
-  const startIdx = utcDayIndex(start);
-  const todayIdx = utcDayIndex(now);
+  const startIdx = businessDayIndex(start, timeZone);
+  const todayIdx = businessDayIndex(now, timeZone);
   const day = Math.min(TRIAL_DAYS, Math.max(1, todayIdx - startIdx + 1));
   const expired =
     plan === 'expired' ||
@@ -76,7 +85,7 @@ function computeTrialProgress(status) {
 
   let daysLeft = TRIAL_DAYS - day;
   if (end && !Number.isNaN(end.getTime())) {
-    const endIdx = utcDayIndex(end);
+    const endIdx = businessDayIndex(end, timeZone);
     daysLeft = Math.max(0, endIdx - todayIdx);
   }
 

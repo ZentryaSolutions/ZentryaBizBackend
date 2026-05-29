@@ -17,6 +17,7 @@ const {
   computeTrialProgress,
   TRIAL_DAYS,
 } = require('../utils/planLifecycle');
+const { DEFAULT_TZ } = require('../utils/businessDate');
 
 router.use(requireAuth);
 
@@ -219,6 +220,7 @@ router.get('/plan-status', async (req, res) => {
       trial_total: trial?.total ?? TRIAL_DAYS,
       trial_days_left: trial?.daysLeft ?? null,
       trial_expired: Boolean(trial?.expired),
+      business_timezone: DEFAULT_TZ,
     });
   } catch (e) {
     console.error('[shop-picker] plan-status:', e);
