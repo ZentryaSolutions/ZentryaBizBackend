@@ -6,7 +6,7 @@ const { requireAuth, requireRole, isElevatedRole } = require('../middleware/auth
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
 const { logSensitiveAccess } = require('../utils/auditLogger');
 const { requireProPlan } = require('../middleware/planMiddleware');
-const { saleSignFactor, lineNetRevenueSql, lineCogsSql } = require('../utils/profitCalculations');
+const { saleSignFactor, saleSignFactorSafe, lineNetRevenueSql, lineCogsSql } = require('../utils/profitCalculations');
 
 // All report routes require authentication and active shop (x-shop-id)
 router.use(requireAuth);
@@ -1822,14 +1822,14 @@ router.get('/dashboard', async (req, res) => {
       }
     }
 
-    const sign = saleSignFactor('s');
+    const sign = saleSignFactorSafe('s');
 
     const todaySalesQuery = `
       SELECT 
-        COALESCE(SUM(${sign} * total_amount), 0) as today_sale,
-        COUNT(*) FILTER (WHERE COALESCE(sale_kind, 'sale') <> 'return' AND invoice_number NOT ILIKE 'CN-%')::int as bill_count
-      FROM sales
-      WHERE date = $1::date AND shop_id = $2
+        COALESCE(SUM(${sign} * s.total_amount), 0) as today_sale,
+        COUNT(*) FILTER (WHERE s.invoice_number NOT ILIKE 'CN-%')::int as bill_count
+      FROM sales s
+      WHERE s.date = $1::date AND s.shop_id = $2
     `;
 
     const todayCogsQuery = isAdmin
@@ -1981,12 +1981,12 @@ router.get('/dashboard', async (req, res) => {
       GROUP BY e.expense_date
     `;
 
-    const lineRevDash = lineNetRevenueSql('si');
-    const lineCogsDash = lineCogsSql('si', 'p');
     const weekGrossProfitQuery = isAdmin
       ? `
       SELECT s.date::date AS d,
-        COALESCE(SUM(${sign} * (${lineRevDash} - ${lineCogsDash})), 0)::float AS gross_profit
+        COALESCE(SUM(
+          ${sign} * (si.selling_price - COALESCE(si.purchase_price, p.purchase_price, 0)) * si.quantity
+        ), 0)::float AS gross_profit
       FROM sale_items si
       JOIN sales s ON si.sale_id = s.sale_id
       LEFT JOIN products p ON si.product_id = p.product_id AND p.shop_id = s.shop_id
@@ -1997,10 +1997,10 @@ router.get('/dashboard', async (req, res) => {
 
     const monthSalesAggQuery = `
       SELECT 
-        COALESCE(SUM(${sign} * total_amount), 0)::float AS total_sales,
-        COALESCE(SUM(${sign} * paid_amount), 0)::float AS cash_collected
-      FROM sales
-      WHERE shop_id = $1 AND date >= $2::date AND date <= $3::date
+        COALESCE(SUM(${sign} * s.total_amount), 0)::float AS total_sales,
+        COALESCE(SUM(${sign} * s.paid_amount), 0)::float AS cash_collected
+      FROM sales s
+      WHERE s.shop_id = $1 AND s.date >= $2::date AND s.date <= $3::date
     `;
 
     const monthCogsQuery = `

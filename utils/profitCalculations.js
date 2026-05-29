@@ -2,9 +2,21 @@
  * Signed sales / COGS helpers — credit notes (returns) count as negative revenue & cost.
  */
 
-/** SQL: -1 for return rows, else +1 */
+function colRef(alias, column) {
+  return alias ? `${alias}.${column}` : column;
+}
+
+/** SQL: -1 for return rows, else +1 (alias optional — use '' for unaliased `sales`). */
 function saleSignFactor(sAlias = 's') {
-  return `(CASE WHEN COALESCE(${sAlias}.sale_kind, 'sale') = 'return' OR ${sAlias}.invoice_number ILIKE 'CN-%' THEN -1 ELSE 1 END)`;
+  const kind = colRef(sAlias, 'sale_kind');
+  const inv = colRef(sAlias, 'invoice_number');
+  return `(CASE WHEN COALESCE(${kind}, 'sale') = 'return' OR ${inv} ILIKE 'CN-%' THEN -1 ELSE 1 END)`;
+}
+
+/** Same as saleSignFactor but only CN- invoices — safe when `sale_kind` column is missing. */
+function saleSignFactorSafe(sAlias = 's') {
+  const inv = colRef(sAlias, 'invoice_number');
+  return `(CASE WHEN ${inv} ILIKE 'CN-%' THEN -1 ELSE 1 END)`;
 }
 
 /** SQL: line net revenue (qty × price − line_discount) */
@@ -19,6 +31,7 @@ function lineCogsSql(siAlias = 'si', pAlias = 'p') {
 
 module.exports = {
   saleSignFactor,
+  saleSignFactorSafe,
   lineNetRevenueSql,
   lineCogsSql,
 };
