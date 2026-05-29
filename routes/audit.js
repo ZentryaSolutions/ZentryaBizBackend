@@ -12,14 +12,29 @@ function ymdOrNull(q) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
 }
 
-/** Shop-scoped audit filter (tries shop_id column, then users.shop_id legacy rows). */
+/**
+ * Shop-scoped audit: rows tagged with shop_id OR performed by any user linked to this shop
+ * (users.shop_id or shop_users + zb_profile_id).
+ */
 function shopScopeSql(shopParam = '$1') {
   return `(
     al.shop_id = ${shopParam}::uuid
-    OR (
-      al.shop_id IS NULL
-      AND al.user_id IN (SELECT user_id FROM users WHERE shop_id = ${shopParam}::uuid)
+    OR al.user_id IN (
+      SELECT u.user_id FROM users u
+      WHERE u.shop_id = ${shopParam}::uuid
+      OR EXISTS (
+        SELECT 1 FROM shop_users su
+        WHERE su.shop_id = ${shopParam}::uuid
+          AND su.user_id = u.zb_profile_id
+      )
     )
+  )`;
+}
+
+function shopScopeSqlFallback(shopParam = '$1') {
+  return `(
+    al.shop_id = ${shopParam}::uuid
+    OR al.user_id IN (SELECT user_id FROM users WHERE shop_id = ${shopParam}::uuid)
   )`;
 }
 
@@ -33,8 +48,13 @@ function buildFilters(req) {
   const action = req.query.action;
   const tableName = req.query.tableName;
   const search = req.query.search;
-  const startYmd = ymdOrNull(req.query.start_date);
-  const endYmd = ymdOrNull(req.query.end_date);
+  let startYmd = ymdOrNull(req.query.start_date);
+  let endYmd = ymdOrNull(req.query.end_date);
+  if (startYmd && endYmd && startYmd > endYmd) {
+    const tmp = startYmd;
+    startYmd = endYmd;
+    endYmd = tmp;
+  }
 
   if (userId) {
     where += ` AND al.user_id = $${n++}`;
@@ -120,18 +140,26 @@ router.get('/', async (req, res) => {
       ]);
     } catch (dbErr) {
       if (dbErr.code !== '42703') throw dbErr;
-      const legacyWhere = 'WHERE 1=1';
-      const legacyList = `
-        SELECT al.*, COALESCE(u.name, u.username, 'System') AS user_name, u.username
+      const fbWhere = `WHERE ${shopScopeSqlFallback('$1')}`;
+      const fbList = `
+        SELECT
+          al.log_id, al.user_id,
+          COALESCE(u.name, u.username, 'System') AS user_name, u.username,
+          al.action, al.table_name, al.record_id,
+          al.old_values, al.new_values, al.ip_address, al.user_agent,
+          al.timestamp, al.notes, al.shop_id
         FROM audit_logs al
         LEFT JOIN users u ON u.user_id = al.user_id
-        ${legacyWhere}
+        ${fbWhere}
         ORDER BY al.timestamp DESC
-        LIMIT $1 OFFSET $2
+        LIMIT $2 OFFSET $3
       `;
       [listR, countR] = await Promise.all([
-        db.query(legacyList, [limit, offset]),
-        db.query(`SELECT COUNT(*)::int AS c FROM audit_logs`, []),
+        db.query(fbList, [req.shopId, limit, offset]),
+        db.query(
+          `SELECT COUNT(*)::int AS c FROM audit_logs al ${fbWhere}`,
+          [req.shopId]
+        ),
       ]);
     }
 

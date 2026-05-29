@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, requireSettingsAdminOrShopOwner } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const { auditFromReq } = require('../lib/auditTrail');
 
 // Settings: Cashiers can read, only admins can write — one row per shop
 // GET route is accessible to both admins and cashiers
@@ -238,6 +239,13 @@ router.put('/', requireSettingsAdminOrShopOwner, async (req, res) => {
     updatedSettings.language = verifiedLanguage || languageToSave;
     console.log('[Settings API] Response language set to:', updatedSettings.language);
     
+    await auditFromReq(req, {
+      action: 'update',
+      tableName: 'settings',
+      recordId: updatedSettings.id,
+      notes: 'Updated shop settings',
+    });
+
     console.log('[Settings API] ===== UPDATE REQUEST SUCCESS =====');
     res.json(updatedSettings);
   } catch (error) {
