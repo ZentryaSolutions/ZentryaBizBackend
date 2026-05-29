@@ -5,6 +5,43 @@
 const nodemailer = require('nodemailer');
 const msGraphMail = require('./msGraphMail');
 const { createLogoutAllToken } = require('./emailSecurityTokens');
+const { parseUserAgent } = require('./parseUserAgent');
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Local time for emails (default Pakistan — override with APP_TIMEZONE). */
+function formatLoginTimes(date = new Date()) {
+  const tz = process.env.APP_TIMEZONE || 'Asia/Karachi';
+  let local = '';
+  let tzLabel = tz;
+  try {
+    local = new Intl.DateTimeFormat('en-PK', {
+      timeZone: tz,
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(date);
+    tzLabel =
+      new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'short' })
+        .formatToParts(date)
+        .find((p) => p.type === 'timeZoneName')?.value || tz;
+  } catch {
+    local = date.toLocaleString('en-PK', { timeZone: tz, hour12: true });
+  }
+  const utc = date.toUTCString();
+  return { local, utc, tz, tzLabel };
+}
 
 function mustGetEnv(name) {
   const v = process.env[name];
@@ -52,9 +89,10 @@ async function sendLoginAlertEmail(req, user) {
   if (!to || !to.includes('@')) return;
 
   const appName = process.env.APP_NAME || 'Zentrya Biz';
-  const when = new Date().toUTCString();
+  const { local: whenLocal, utc: whenUtc, tzLabel } = formatLoginTimes(new Date());
   const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || req.ip || '').toString().split(',')[0].trim();
-  const ua = String(req.get?.('user-agent') || req.headers['user-agent'] || '').slice(0, 400);
+  const uaRaw = String(req.get?.('user-agent') || req.headers['user-agent'] || '');
+  const deviceLabel = parseUserAgent(uaRaw);
   const name = String(user.displayName || '').trim() || 'there';
 
   let revokeUrl = '';
@@ -75,9 +113,10 @@ async function sendLoginAlertEmail(req, user) {
     `Hi ${name},`,
     '',
     `Your ${appName} account was signed in successfully.`,
-    `Time (UTC): ${when}`,
+    `Time (${tzLabel}): ${whenLocal}`,
+    `Time (UTC): ${whenUtc}`,
     `IP: ${ip || 'unknown'}`,
-    `Browser/device: ${ua || 'unknown'}`,
+    `Browser: ${deviceLabel}`,
     '',
     revokeUrl
       ? `If this was not you, open this link to sign out all devices and invalidate sessions:\n${revokeUrl}`
@@ -104,9 +143,10 @@ async function sendLoginAlertEmail(req, user) {
         <div style="font-size:14px; color:#111827;">Hi ${name},</div>
         <p style="font-size:14px; color:#374151; margin:12px 0 0 0;">Your account was signed in successfully.</p>
         <table style="font-size:13px; color:#374151; margin-top:14px; border-collapse:collapse;">
-          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Time (UTC)</td><td>${when}</td></tr>
-          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">IP</td><td>${ip || 'unknown'}</td></tr>
-          <tr><td style="padding:4px 12px 4px 0; color:#6b7280; vertical-align:top;">Device</td><td style="word-break:break-all;">${ua || 'unknown'}</td></tr>
+          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Time</td><td>${escapeHtml(whenLocal)} <span style="color:#6b7280;">(${escapeHtml(tzLabel)})</span></td></tr>
+          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">UTC</td><td style="color:#6b7280;">${escapeHtml(whenUtc)}</td></tr>
+          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">IP</td><td>${escapeHtml(ip || 'unknown')}</td></tr>
+          <tr><td style="padding:4px 12px 4px 0; color:#6b7280;">Browser</td><td>${escapeHtml(deviceLabel)}</td></tr>
         </table>
         ${revokeBlock}
       </div>
