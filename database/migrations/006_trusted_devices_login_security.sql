@@ -1,0 +1,26 @@
+-- Trusted browsers/devices for Zentrya zb-simple-session (x-device-id).
+-- Email tokens for "log out all sessions" links from login alert emails.
+
+CREATE TABLE IF NOT EXISTS public.zb_trusted_devices (
+  user_id INTEGER NOT NULL REFERENCES public.users(user_id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_zb_trusted_devices_user_id ON public.zb_trusted_devices(user_id);
+
+CREATE TABLE IF NOT EXISTS public.email_security_tokens (
+  id BIGSERIAL PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL REFERENCES public.users(user_id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL DEFAULT 'logout_all',
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_security_tokens_user_id ON public.email_security_tokens(user_id);
+
+-- email_otps.purpose may be constrained; allow 'new_device' if a check exists.
+ALTER TABLE public.email_otps DROP CONSTRAINT IF EXISTS email_otps_purpose_check;
