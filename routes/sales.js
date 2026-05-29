@@ -897,6 +897,67 @@ function buildReturnNotes(originalInvoice, returnReason) {
   return `REF:${originalInvoice} | REASON:${reason}`;
 }
 
+/** Persist return header + lines in sales_returns tables (optional if migration not applied). */
+async function persistSalesReturnTables(client, payload) {
+  await client.query('SAVEPOINT sp_sales_returns_tbl');
+  try {
+    const hdr = await client.query(
+      `INSERT INTO sales_returns (
+         shop_id, sale_id, original_sale_id, return_number, return_reason, refund_type,
+         subtotal, discount, tax, total_amount, paid_amount, payment_type,
+         customer_id, customer_name, created_by, return_date
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING return_id`,
+      [
+        payload.shopId,
+        payload.saleId,
+        payload.originalSaleId,
+        payload.returnNumber,
+        payload.returnReason,
+        payload.refundType,
+        payload.subtotal,
+        payload.discount,
+        payload.tax,
+        payload.totalAmount,
+        payload.paidAmount,
+        payload.paymentType,
+        payload.customerId,
+        payload.customerName,
+        payload.createdBy,
+        payload.returnDate,
+      ]
+    );
+    const returnId = hdr.rows[0].return_id;
+    for (const line of payload.lines) {
+      const lineTotal = Math.max(
+        0,
+        (parseFloat(line.selling_price) || 0) * (parseFloat(line.quantity) || 0) -
+          (parseFloat(line.line_discount) || 0)
+      );
+      await client.query(
+        `INSERT INTO sales_return_items (
+           return_id, product_id, quantity, selling_price, purchase_price, line_discount, line_total
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          returnId,
+          line.product_id,
+          line.quantity,
+          line.selling_price,
+          line.purchase_price,
+          line.line_discount || 0,
+          lineTotal,
+        ]
+      );
+    }
+    await client.query('RELEASE SAVEPOINT sp_sales_returns_tbl');
+    return returnId;
+  } catch (e) {
+    await client.query('ROLLBACK TO SAVEPOINT sp_sales_returns_tbl');
+    if (e.code === '42P01' || e.code === '42703') return null;
+    throw e;
+  }
+}
+
 /**
  * Return / refund — creates credit note, restores stock, adjusts customer balance.
  * Body: { items: [{ product_id, quantity }], refund_type: 'cash'|'credit', return_reason: string (required) }
@@ -1106,6 +1167,26 @@ router.post('/:id/return', async (req, res) => {
       );
     }
 
+    const returnId = await persistSalesReturnTables(client, {
+      shopId: req.shopId,
+      saleId: returnSaleId,
+      originalSaleId: originalId,
+      returnNumber: creditNoteNumber,
+      returnReason,
+      refundType,
+      subtotal: subtotalReturn,
+      discount: returnLineDiscount,
+      tax: 0,
+      totalAmount: grandTotal,
+      paidAmount,
+      paymentType,
+      customerId: original.customer_id || null,
+      customerName: original.customer_name || null,
+      createdBy: userId,
+      returnDate: saleBusinessDate,
+      lines: linesToInsert,
+    });
+
     await client.query('COMMIT');
 
     await auditFromReq(req, {
@@ -1139,6 +1220,7 @@ router.post('/:id/return', async (req, res) => {
 
     res.status(201).json({
       ...detail.rows[0],
+      return_id: returnId || returnSaleId,
       refund_type: refundType,
       refund_cash_amount: refundType === 'cash' ? grandTotal : 0,
       original_invoice: original.invoice_number,

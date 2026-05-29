@@ -282,7 +282,7 @@ router.post('/quick-stats', async (req, res) => {
       return res.json({ ok: true, stats: {} });
     }
 
-    const todayStr = getBusinessTodayDateString();
+    const todayStr = await getBusinessTodayDateString(db);
     const byShop = {};
     allowedIds.forEach((id) => {
       byShop[String(id)] = { todaySales: 0, productCount: 0 };

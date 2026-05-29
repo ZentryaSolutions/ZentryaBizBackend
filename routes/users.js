@@ -285,20 +285,21 @@ router.get('/', async (req, res) => {
 
     const userCount = result.rows.length;
     const isAuditFilter = req.query.context === 'audit_filter';
-    await logSensitiveAccess(
-      req.user.user_id,
-      'users',
-      req.ip || req.connection.remoteAddress,
-      req.get('user-agent'),
-      {
-        shopId,
-        context: isAuditFilter ? 'audit_filter' : 'page',
-        description: isAuditFilter
-          ? `Loaded staff names for audit filters (${userCount} users)`
-          : `Opened Users page — listed ${userCount} staff member(s)`,
-        meta: { user_count: userCount },
-      }
-    );
+    // Dropdown data for Audit History filters — not a meaningful admin action; do not audit-log it.
+    if (!isAuditFilter) {
+      await logSensitiveAccess(
+        req.user.user_id,
+        'users',
+        req.ip || req.connection.remoteAddress,
+        req.get('user-agent'),
+        {
+          shopId,
+          context: 'page',
+          description: `Opened Users page — listed ${userCount} staff member(s)`,
+          meta: { user_count: userCount },
+        }
+      );
+    }
 
     res.json({
       success: true,

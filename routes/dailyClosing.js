@@ -11,7 +11,7 @@ router.use(requireShopContext);
 /** Today's figures for close-day modal */
 router.get('/today-summary', async (req, res) => {
   try {
-    const today = await getBusinessTodayDateString();
+    const today = await getBusinessTodayDateString(db);
     const shopId = req.shopId;
 
     const salesRes = await db.query(
@@ -77,7 +77,7 @@ router.get('/today-summary', async (req, res) => {
 
 router.post('/close', async (req, res) => {
   try {
-    const today = await getBusinessTodayDateString();
+    const today = await getBusinessTodayDateString(db);
     const opening = parseFloat(req.body?.opening_cash) || 0;
     const actual = parseFloat(req.body?.actual_cash);
     if (!Number.isFinite(actual)) {

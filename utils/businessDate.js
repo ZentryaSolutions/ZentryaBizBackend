@@ -4,12 +4,14 @@
  * Set BUSINESS_TIMEZONE in backend .env (IANA name), e.g. Asia/Karachi, Asia/Dubai.
  */
 const DEFAULT_TZ = process.env.BUSINESS_TIMEZONE || 'Asia/Karachi';
+const defaultDb = require('../db');
 
 /**
- * @param {import('pg').Pool | import('pg').PoolClient} db
+ * @param {import('pg').Pool | import('pg').PoolClient} [dbConn] — defaults to app pool
  * @returns {Promise<string>} YYYY-MM-DD in business timezone
  */
-async function getBusinessTodayDateString(db) {
+async function getBusinessTodayDateString(dbConn) {
+  const db = dbConn || defaultDb;
   const { rows } = await db.query(
     `SELECT to_char((timezone($1, now()))::date, 'YYYY-MM-DD') AS d`,
     [DEFAULT_TZ]

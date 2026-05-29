@@ -3,7 +3,6 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, requireRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
-const { logSensitiveAccess } = require('../utils/auditLogger');
 router.use(requireAuth);
 router.use(requireShopContext);
 router.use(requireRole('administrator'));
@@ -91,6 +90,12 @@ function buildFilters(req) {
     n++;
   }
 
+  // Passive UI loads (filter dropdowns, opening this page, etc.) — not real business actions.
+  where += `
+    AND COALESCE(al.notes, '') NOT ILIKE 'Loaded %'
+    AND COALESCE(al.notes, '') NOT ILIKE 'Opened Audit History%'
+  `;
+
   return { where, params, nextParam: n };
 }
 
@@ -103,35 +108,13 @@ router.get('/', async (req, res) => {
     const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
     const { where, params, nextParam } = buildFilters(req);
 
-    if (offset === 0) {
-      const hasFilters = Boolean(
-        req.query.userId ||
-          req.query.action ||
-          req.query.tableName ||
-          req.query.search ||
-          req.query.start_date ||
-          req.query.end_date
-      );
-      await logSensitiveAccess(
-        req.user.user_id,
-        'audit',
-        req.ip || req.connection?.remoteAddress,
-        req.get('user-agent'),
-        {
-          shopId: req.shopId,
-          description: hasFilters
-            ? 'Opened Audit History (with filters)'
-            : 'Opened Audit History',
-        }
-      );
-    }
-
     const listSql = `
       SELECT
         al.log_id,
         al.user_id,
         COALESCE(u.name, u.username, 'System') AS user_name,
         u.username,
+        u.role AS user_role,
         al.action,
         al.table_name,
         al.record_id,
@@ -170,7 +153,7 @@ router.get('/', async (req, res) => {
       const fbList = `
         SELECT
           al.log_id, al.user_id,
-          COALESCE(u.name, u.username, 'System') AS user_name, u.username,
+          COALESCE(u.name, u.username, 'System') AS user_name, u.username, u.role AS user_role,
           al.action, al.table_name, al.record_id,
           al.old_values, al.new_values, al.ip_address, al.user_agent,
           al.timestamp, al.notes, al.shop_id
