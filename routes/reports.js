@@ -130,15 +130,19 @@ function ymdRangeFromQuery(start_date, end_date) {
 // Get comprehensive report with sales, purchases, and cash - Admin only
 router.get('/comprehensive', requireRole('administrator'), requireProPlan, async (req, res) => {
   try {
-    // Log sensitive access
+    const { period = 'monthly', productId, supplierId } = req.query;
+
     await logSensitiveAccess(
       req.user.user_id,
       'reports',
       req.ip || req.connection.remoteAddress,
-      req.get('user-agent')
+      req.get('user-agent'),
+      {
+        shopId: req.shopId,
+        description: `Opened comprehensive report (${period})`,
+        meta: { period, productId: productId || null, supplierId: supplierId || null },
+      }
     );
-
-    const { period = 'monthly', productId, supplierId } = req.query;
     const { startDate, endDate } = getDateRange(period);
     const shopId = req.shopId;
 

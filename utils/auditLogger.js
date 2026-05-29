@@ -156,17 +156,46 @@ async function logLogout(userId, ipAddress, userAgent) {
   });
 }
 
+const RESOURCE_VIEW_LABELS = {
+  users: 'Users & staff',
+  audit: 'Audit history',
+  audit_logs: 'Audit history',
+  reports: 'Reports',
+  profit: 'Profit report',
+  dashboard: 'Dashboard',
+  settings: 'Settings',
+};
+
 /**
- * Log sensitive data access (profit, reports, etc.)
+ * Log read-only access to admin screens or reports (descriptive notes for audit UI).
+ * @param {string} resource — module key (stored in table_name)
+ * @param {object|string} [options] — { description, shopId, context, meta }
  */
-async function logSensitiveAccess(userId, resource, ipAddress, userAgent) {
+async function logSensitiveAccess(userId, resource, ipAddress, userAgent, options = {}) {
+  const opts = typeof options === 'string' ? { description: options } : options || {};
+  const { description, shopId = null, context = null, meta = null } = opts;
+
+  let notes = description;
+  if (!notes) {
+    const label = RESOURCE_VIEW_LABELS[resource] || String(resource || 'page').replace(/_/g, ' ');
+    notes =
+      context === 'audit_filter'
+        ? `Loaded ${label} for audit filters`
+        : `Opened ${label}`;
+    if (meta?.user_count != null) notes += ` (${meta.user_count} users)`;
+    else if (meta?.count != null) notes += ` (${meta.count} records)`;
+    else if (meta?.period) notes += ` — ${meta.period}`;
+  }
+
   await logAuditEvent({
     userId,
-    action: 'view_sensitive',
+    shopId,
+    action: 'view',
     tableName: resource,
-    notes: `Accessed sensitive resource: ${resource}`,
+    newValues: meta && typeof meta === 'object' ? meta : null,
+    notes,
     ipAddress,
-    userAgent
+    userAgent,
   });
 }
 

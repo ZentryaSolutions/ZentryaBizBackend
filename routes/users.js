@@ -235,13 +235,6 @@ async function usernameTakenInShop(username, shopId) {
  */
 router.get('/', async (req, res) => {
   try {
-    await logSensitiveAccess(
-      req.user.user_id,
-      'users',
-      req.ip || req.connection.remoteAddress,
-      req.get('user-agent')
-    );
-
     const shopId = req.shopId;
     let result;
     try {
@@ -289,6 +282,23 @@ router.get('/', async (req, res) => {
         throw e;
       }
     }
+
+    const userCount = result.rows.length;
+    const isAuditFilter = req.query.context === 'audit_filter';
+    await logSensitiveAccess(
+      req.user.user_id,
+      'users',
+      req.ip || req.connection.remoteAddress,
+      req.get('user-agent'),
+      {
+        shopId,
+        context: isAuditFilter ? 'audit_filter' : 'page',
+        description: isAuditFilter
+          ? `Loaded staff names for audit filters (${userCount} users)`
+          : `Opened Users page — listed ${userCount} staff member(s)`,
+        meta: { user_count: userCount },
+      }
+    );
 
     res.json({
       success: true,
@@ -965,7 +975,11 @@ router.get('/audit-logs', requirePremiumPlan, async (req, res) => {
       req.user.user_id,
       'audit_logs',
       req.ip || req.connection.remoteAddress,
-      req.get('user-agent')
+      req.get('user-agent'),
+      {
+        shopId: req.shopId,
+        description: 'Exported audit log list (legacy admin screen)',
+      }
     );
 
     let query = `
