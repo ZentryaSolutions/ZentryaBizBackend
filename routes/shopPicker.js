@@ -11,7 +11,12 @@ function normalizeShopUuidList(ids) {
 const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
 const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimits');
-const { refreshPlanLifecycleForProfile, getShopPlanAccess } = require('../utils/planLifecycle');
+const {
+  refreshPlanLifecycleForProfile,
+  getShopPlanAccess,
+  computeTrialProgress,
+  TRIAL_DAYS,
+} = require('../utils/planLifecycle');
 
 router.use(requireAuth);
 
@@ -203,12 +208,17 @@ router.get('/plan-status', async (req, res) => {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
     }
     const status = await refreshPlanLifecycleForProfile(ownerId);
+    const trial = computeTrialProgress(status);
     return res.json({
       ok: true,
       plan: status?.plan || 'trial',
       shop_limit: status?.shop_limit,
       trial_started_at: status?.trial_started_at || null,
       trial_ends_at: status?.trial_ends_at || null,
+      trial_day: trial?.day ?? null,
+      trial_total: trial?.total ?? TRIAL_DAYS,
+      trial_days_left: trial?.daysLeft ?? null,
+      trial_expired: Boolean(trial?.expired),
     });
   } catch (e) {
     console.error('[shop-picker] plan-status:', e);

@@ -35,6 +35,54 @@ function daysUntil(value) {
   return Math.max(0, Math.ceil((d - Date.now()) / DAY_MS));
 }
 
+/** UTC calendar day index (midnight UTC) for consistent trial day counting. */
+function utcDayIndex(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return null;
+  return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / DAY_MS);
+}
+
+/**
+ * Trial progress from DB timestamps (matches profiles.trial_started_at / trial_ends_at).
+ * Day 1 = calendar day of trial_started_at (UTC).
+ */
+function computeTrialProgress(status) {
+  const plan = normalizePlan(status?.plan);
+  if (plan !== 'trial') return null;
+
+  const now = new Date();
+  let start = status?.trial_started_at ? new Date(status.trial_started_at) : null;
+  const end = status?.trial_ends_at ? new Date(status.trial_ends_at) : null;
+
+  if ((!start || Number.isNaN(start.getTime())) && end && !Number.isNaN(end.getTime())) {
+    start = new Date(end.getTime() - TRIAL_DAYS * DAY_MS);
+  }
+  if (!start || Number.isNaN(start.getTime())) {
+    return {
+      day: 1,
+      total: TRIAL_DAYS,
+      daysLeft: TRIAL_DAYS - 1,
+      expired: false,
+    };
+  }
+
+  const startIdx = utcDayIndex(start);
+  const todayIdx = utcDayIndex(now);
+  const day = Math.min(TRIAL_DAYS, Math.max(1, todayIdx - startIdx + 1));
+  const expired =
+    plan === 'expired' ||
+    Number(status?.shop_limit) <= 0 ||
+    (end && Number.isFinite(end.getTime()) && end.getTime() <= now.getTime());
+
+  let daysLeft = TRIAL_DAYS - day;
+  if (end && !Number.isNaN(end.getTime())) {
+    const endIdx = utcDayIndex(end);
+    daysLeft = Math.max(0, endIdx - todayIdx);
+  }
+
+  return { day, total: TRIAL_DAYS, daysLeft, expired };
+}
+
 async function ensurePlanLifecycleColumns() {
   if (lifecycleColumnsReady) return;
   if (lifecycleColumnsPromise) return lifecycleColumnsPromise;
@@ -240,6 +288,7 @@ module.exports = {
   ensurePlanLifecycleColumns,
   refreshPlanLifecycleForProfile,
   getShopPlanAccess,
+  computeTrialProgress,
   maybeSendPlanRenewalReminder,
   sendDuePlanRenewalReminders,
 };
