@@ -1,6 +1,0 @@
--- Scope HisaabKitab `users` rows to a Zentrya shop (matches x-shop-id / session shop).
--- Profile-linked staff use shop_users; locally created cashiers use users.shop_id.
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_id UUID;
-
-CREATE INDEX IF NOT EXISTS idx_users_shop_id ON users (shop_id) WHERE shop_id IS NOT NULL;

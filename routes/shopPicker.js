@@ -11,6 +11,9 @@ function normalizeShopUuidList(ids) {
 const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
 const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimits');
+const { refreshPlanLifecycleForProfile, getShopPlanAccess } = require('../utils/planLifecycle');
+
+router.use(requireAuth);
 
 async function insertShopRow(client, row) {
   const {
@@ -82,7 +85,6 @@ async function createShopViaRpc(ownerId, payload) {
  * Body: { shopIds: (string|number)[] }
  * Response: { ok: true, stats: { [shopId: string]: { todaySales: number, productCount: number } } }
  */
-router.use(requireAuth);
 
 async function resolveProfileId(req) {
   const headerId = String(req.headers['x-zb-profile-id'] || '').trim();
@@ -192,6 +194,49 @@ async function repairOwnerShopLinks(profileIds) {
 }
 
 /**
+ * Plan / trial status (expires trial when due, returns fresh profile plan fields).
+ */
+router.get('/plan-status', async (req, res) => {
+  try {
+    const ownerId = await resolveProfileId(req);
+    if (!ownerId) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+    const status = await refreshPlanLifecycleForProfile(ownerId);
+    return res.json({
+      ok: true,
+      plan: status?.plan || 'trial',
+      shop_limit: status?.shop_limit,
+      trial_started_at: status?.trial_started_at || null,
+      trial_ends_at: status?.trial_ends_at || null,
+    });
+  } catch (e) {
+    console.error('[shop-picker] plan-status:', e);
+    return res.status(500).json({ error: e.message || 'Failed to load plan status' });
+  }
+});
+
+/**
+ * Verify owner plan allows opening a shop (trial not expired, etc.).
+ */
+router.get('/shop-access/:shopId', async (req, res) => {
+  try {
+    const shopId = String(req.params.shopId || '').trim();
+    if (!UUID_RE.test(shopId)) {
+      return res.status(400).json({ error: 'Invalid shop id' });
+    }
+    const access = await getShopPlanAccess(shopId);
+    if (!access.ok) {
+      return res.status(access.status || 402).json(access.body || { error: 'Subscription expired' });
+    }
+    return res.json({ ok: true, plan: access.status?.plan || null });
+  } catch (e) {
+    console.error('[shop-picker] shop-access:', e);
+    return res.status(500).json({ error: e.message || 'Failed to verify shop access' });
+  }
+});
+
+/**
  * Shops for My Shops page (owner + membership). Uses Postgres, not Supabase RLS joins.
  */
 router.get('/my-shops', async (req, res) => {
@@ -199,6 +244,11 @@ router.get('/my-shops', async (req, res) => {
     const profileIds = await resolveLinkedProfileIds(req);
     if (!profileIds.length) {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    const ownerId = await resolveProfileId(req);
+    if (ownerId) {
+      await refreshPlanLifecycleForProfile(ownerId);
     }
 
     await repairOwnerShopLinks(profileIds);
@@ -351,29 +401,15 @@ router.post('/create-shop', async (req, res) => {
       return res.status(403).json({ error: 'Profile not linked to this account.' });
     }
 
-    let prof;
-    try {
-      prof = await db.query(
-        `SELECT plan::text AS plan, shop_limit
-           FROM public.profiles
-          WHERE id = ANY($1::uuid[])
-          ORDER BY CASE lower(coalesce(plan::text, 'trial'))
-            WHEN 'premium' THEN 0 WHEN 'pro' THEN 1 WHEN 'starter' THEN 2 WHEN 'trial' THEN 3 ELSE 4
-          END
-          LIMIT 1`,
-        [profileIds]
-      );
-    } catch (colErr) {
-      prof = await db.query(
-        `SELECT plan::text AS plan FROM public.profiles WHERE id = ANY($1::uuid[]) LIMIT 1`,
-        [profileIds]
-      );
-    }
-    if (!prof.rows.length) {
+    const planStatus = await refreshPlanLifecycleForProfile(ownerId);
+    const planRow = planStatus
+      ? { plan: planStatus.plan, shop_limit: planStatus.shop_limit }
+      : null;
+
+    if (!planRow) {
       return res.status(404).json({ error: 'Profile not found' });
     }
 
-    const planRow = prof.rows[0];
     const limit = resolveShopLimit(planRow);
     if (limit <= 0) {
       return res.status(403).json({
