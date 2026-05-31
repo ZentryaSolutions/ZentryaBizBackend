@@ -12,37 +12,12 @@ function ymdOrNull(q) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
 }
 
-/**
- * Shop-scoped audit: rows tagged with shop_id OR performed by any user linked to this shop
- * (users.shop_id or shop_users + zb_profile_id).
- */
-function shopScopeSql(shopParam = '$1') {
-  return `(
-    al.shop_id = ${shopParam}::uuid
-    OR al.user_id IN (
-      SELECT u.user_id FROM users u
-      WHERE u.shop_id = ${shopParam}::uuid
-      OR EXISTS (
-        SELECT 1 FROM shop_users su
-        WHERE su.shop_id = ${shopParam}::uuid
-          AND su.user_id = u.zb_profile_id
-      )
-    )
-  )`;
-}
-
-function shopScopeSqlFallback(shopParam = '$1') {
-  return `(
-    al.shop_id = ${shopParam}::uuid
-    OR al.user_id IN (SELECT user_id FROM users WHERE shop_id = ${shopParam}::uuid)
-  )`;
-}
-
+/** Strict tenant isolation — only rows explicitly tagged for this shop. */
 function buildFilters(req) {
   const shopId = req.shopId;
   const params = [shopId];
   let n = 2;
-  let where = `WHERE ${shopScopeSql('$1')}`;
+  let where = 'WHERE al.shop_id = $1::uuid';
 
   const userId = req.query.userId;
   const action = req.query.action;
@@ -149,27 +124,14 @@ router.get('/', async (req, res) => {
       ]);
     } catch (dbErr) {
       if (dbErr.code !== '42703') throw dbErr;
-      const fbWhere = `WHERE ${shopScopeSqlFallback('$1')}`;
-      const fbList = `
-        SELECT
-          al.log_id, al.user_id,
-          COALESCE(u.name, u.username, 'System') AS user_name, u.username, u.role AS user_role,
-          al.action, al.table_name, al.record_id,
-          al.old_values, al.new_values, al.ip_address, al.user_agent,
-          al.timestamp, al.notes, al.shop_id
-        FROM audit_logs al
-        LEFT JOIN users u ON u.user_id = al.user_id
-        ${fbWhere}
-        ORDER BY al.timestamp DESC
-        LIMIT $2 OFFSET $3
-      `;
-      [listR, countR] = await Promise.all([
-        db.query(fbList, [req.shopId, limit, offset]),
-        db.query(
-          `SELECT COUNT(*)::int AS c FROM audit_logs al ${fbWhere}`,
-          [req.shopId]
-        ),
-      ]);
+      return res.json({
+        logs: [],
+        total: 0,
+        limit,
+        offset,
+        filters: { actions: [], tables: [] },
+        message: 'Audit shop_id column missing — run latest database migrations.',
+      });
     }
 
     let actionsR = { rows: [] };

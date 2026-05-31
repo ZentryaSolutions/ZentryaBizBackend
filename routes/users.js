@@ -507,6 +507,7 @@ router.post('/', async (req, res) => {
     try {
       await logAuditEvent({
         userId: req.user.user_id,
+        shopId: req.shopId,
         action: 'create',
         tableName: 'users',
         recordId: newUser.user_id,
@@ -809,6 +810,7 @@ router.put('/:id', async (req, res) => {
 
     await logAuditEvent({
       userId: req.user.user_id,
+      shopId: req.shopId,
       action: 'update',
       tableName: 'users',
       recordId: userId,
@@ -942,6 +944,7 @@ router.delete('/:id', async (req, res) => {
 
     await logAuditEvent({
       userId: req.user.user_id,
+      shopId: req.shopId,
       action: 'delete',
       tableName: 'users',
       recordId: userId,
@@ -971,6 +974,7 @@ router.delete('/:id', async (req, res) => {
 router.get('/audit-logs', requirePremiumPlan, async (req, res) => {
   try {
     const { limit = 100, offset = 0, userId, action, tableName } = req.query;
+    const shopId = req.shopId;
 
     await logSensitiveAccess(
       req.user.user_id,
@@ -978,12 +982,29 @@ router.get('/audit-logs', requirePremiumPlan, async (req, res) => {
       req.ip || req.connection.remoteAddress,
       req.get('user-agent'),
       {
-        shopId: req.shopId,
+        shopId,
         description: 'Exported audit log list (legacy admin screen)',
       }
     );
 
-    let query = `
+    const params = [shopId];
+    let n = 2;
+    let where = 'WHERE al.shop_id = $1::uuid';
+
+    if (userId) {
+      where += ` AND al.user_id = $${n++}`;
+      params.push(parseInt(userId, 10));
+    }
+    if (action) {
+      where += ` AND al.action = $${n++}`;
+      params.push(String(action).trim());
+    }
+    if (tableName) {
+      where += ` AND al.table_name = $${n++}`;
+      params.push(String(tableName).trim());
+    }
+
+    const query = `
       SELECT 
         al.log_id,
         al.user_id,
@@ -997,50 +1018,23 @@ router.get('/audit-logs', requirePremiumPlan, async (req, res) => {
         al.ip_address,
         al.user_agent,
         al.timestamp,
-        al.notes
+        al.notes,
+        al.shop_id
       FROM audit_logs al
       LEFT JOIN users u ON al.user_id = u.user_id
-      WHERE 1=1
+      ${where}
+      ORDER BY al.timestamp DESC
+      LIMIT $${n++} OFFSET $${n++}
     `;
-    const params = [];
-    let paramCount = 1;
-
-    if (userId) {
-      query += ` AND al.user_id = $${paramCount++}`;
-      params.push(userId);
-    }
-
-    if (action) {
-      query += ` AND al.action = $${paramCount++}`;
-      params.push(action);
-    }
-
-    if (tableName) {
-      query += ` AND al.table_name = $${paramCount++}`;
-      params.push(tableName);
-    }
-
-    query += ` ORDER BY al.timestamp DESC LIMIT $${paramCount++} OFFSET $${paramCount++}`;
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(parseInt(limit, 10), parseInt(offset, 10));
 
     const result = await db.query(query, params);
 
-    // Get total count
-    const countQuery = `
-      SELECT COUNT(*) as count
-      FROM audit_logs al
-      WHERE 1=1
-      ${userId ? `AND al.user_id = $1` : ''}
-      ${action ? `AND al.action = $${userId ? '2' : '1'}` : ''}
-      ${tableName ? `AND al.table_name = $${userId && action ? '3' : userId || action ? '2' : '1'}` : ''}
-    `;
-    const countParams = [];
-    if (userId) countParams.push(userId);
-    if (action) countParams.push(action);
-    if (tableName) countParams.push(tableName);
-
-    const countResult = await db.query(countQuery, countParams);
-    const total = parseInt(countResult.rows[0].count);
+    const countResult = await db.query(
+      `SELECT COUNT(*)::int AS count FROM audit_logs al ${where}`,
+      params.slice(0, params.length - 2)
+    );
+    const total = countResult.rows[0]?.count ?? 0;
 
     res.json({
       success: true,
@@ -1099,6 +1093,7 @@ router.post('/:id/generate-password', async (req, res) => {
 
     await logAuditEvent({
       userId: req.user.user_id,
+      shopId: req.shopId,
       action: 'update',
       tableName: 'users',
       recordId: userId,
