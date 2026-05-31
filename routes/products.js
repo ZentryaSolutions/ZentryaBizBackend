@@ -88,6 +88,108 @@ router.get('/', async (req, res) => {
   }
 });
 
+/** Return lines for a product — dedicated tables + CN sale_items (same as Returns detail). */
+async function fetchProductReturnLines(productId, shopId) {
+  let dedicated = [];
+  let hasReturnTables = true;
+
+  try {
+    const result = await db.query(
+      `SELECT
+        COALESCE(sr.return_id, sr.sale_id) AS return_id,
+        sr.sale_id,
+        sr.return_number,
+        sr.return_date AS date,
+        sr.return_reason,
+        sr.refund_type,
+        sr.original_sale_id,
+        orig.invoice_number AS original_invoice_number,
+        sri.return_item_id,
+        sri.quantity,
+        sri.selling_price,
+        sri.line_total,
+        COALESCE(c.name, sr.customer_name) AS customer_name
+      FROM sales_return_items sri
+      JOIN sales_returns sr ON sr.return_id = sri.return_id AND sr.shop_id = $2
+      LEFT JOIN customers c ON c.customer_id = sr.customer_id AND c.shop_id = sr.shop_id
+      LEFT JOIN sales orig
+        ON orig.sale_id = sr.original_sale_id AND orig.shop_id = sr.shop_id
+      WHERE sri.product_id = $1 AND sr.shop_id = $2
+      ORDER BY sr.return_date DESC NULLS LAST, sr.return_id DESC, sri.return_item_id DESC`,
+      [productId, shopId]
+    );
+    dedicated = result.rows;
+  } catch (error) {
+    if (error.code !== '42P01') throw error;
+    hasReturnTables = false;
+  }
+
+  const coveredSaleIds = new Set(
+    dedicated.map((r) => String(r.sale_id)).filter((id) => id && id !== 'undefined')
+  );
+
+  let legacyExclude = '';
+  if (hasReturnTables && coveredSaleIds.size > 0) {
+    legacyExclude = ` AND NOT EXISTS (
+      SELECT 1
+      FROM sales_return_items sri2
+      JOIN sales_returns sr2 ON sr2.return_id = sri2.return_id AND sr2.shop_id = $2
+      WHERE sr2.sale_id = s.sale_id AND sri2.product_id = si.product_id
+    )`;
+  }
+
+  const legacy = await db.query(
+    `SELECT
+      s.sale_id AS return_id,
+      s.sale_id,
+      s.invoice_number AS return_number,
+      s.date,
+      s.notes,
+      s.original_sale_id,
+      orig.invoice_number AS original_invoice_number,
+      si.sale_item_id AS return_item_id,
+      si.quantity,
+      si.selling_price,
+      (COALESCE(si.quantity, 0) * COALESCE(si.selling_price, 0)) AS line_total,
+      COALESCE(c.name, s.customer_name) AS customer_name,
+      CASE
+        WHEN lower(COALESCE(s.payment_type, 'cash')) = 'credit' THEN 'credit'
+        ELSE 'cash'
+      END AS refund_type
+    FROM sale_items si
+    JOIN sales s ON si.sale_id = s.sale_id AND s.shop_id = $2
+    LEFT JOIN customers c ON c.customer_id = s.customer_id AND c.shop_id = s.shop_id
+    LEFT JOIN sales orig
+      ON orig.sale_id = s.original_sale_id AND orig.shop_id = s.shop_id
+    WHERE si.product_id = $1
+      AND s.shop_id = $2
+      AND (
+        lower(COALESCE(s.sale_kind, '')) = 'return'
+        OR s.invoice_number ILIKE 'CN-%'
+      )
+      ${legacyExclude}
+    ORDER BY s.date DESC NULLS LAST, s.sale_id DESC, si.sale_item_id DESC`,
+    [productId, shopId]
+  );
+
+  const legacyRows = legacy.rows.map((row) => {
+    const notes = String(row.notes || '');
+    const reasonMatch = notes.match(/REASON:([^|]*)/i);
+    return {
+      ...row,
+      return_reason: reasonMatch ? String(reasonMatch[1]).trim() : notes.trim(),
+    };
+  });
+
+  const merged = [...dedicated, ...legacyRows];
+  merged.sort((a, b) => {
+    const ta = a.date ? new Date(a.date).getTime() : 0;
+    const tb = b.date ? new Date(b.date).getTime() : 0;
+    return tb - ta;
+  });
+  return merged;
+}
+
 // Purchase + sale line history for product detail screen (must be before GET /:id if ever ambiguous)
 router.get('/:id/activity', async (req, res) => {
   try {
@@ -106,7 +208,7 @@ router.get('/:id/activity', async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const [purchasesResult, salesResult] = await Promise.all([
+    const [purchasesResult, salesResult, returnsRows] = await Promise.all([
       db.query(
         `SELECT 
           p.purchase_id,
@@ -138,6 +240,7 @@ router.get('/:id/activity', async (req, res) => {
         ORDER BY s.date DESC NULLS LAST, s.sale_id DESC`,
         [pid, shopId]
       ),
+      fetchProductReturnLines(pid, shopId),
     ]);
 
     const purchases = purchasesResult.rows.map((row) => ({
@@ -145,7 +248,12 @@ router.get('/:id/activity', async (req, res) => {
       invoice_ref: `PUR-${String(row.purchase_id).padStart(6, '0')}`,
     }));
 
-    res.json({ purchases, sales: salesResult.rows });
+    const returns = (returnsRows || []).map((row) => ({
+      ...row,
+      invoice_ref: row.return_number || `CN-${String(row.return_id).padStart(6, '0')}`,
+    }));
+
+    res.json({ purchases, sales: salesResult.rows, returns });
   } catch (error) {
     console.error('Error fetching product activity:', error);
     res.status(500).json({ error: 'Failed to fetch product activity', message: error.message });

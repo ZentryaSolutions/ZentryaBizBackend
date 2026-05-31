@@ -1,0 +1,283 @@
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+const { requireAuth, isElevatedRole } = require('../middleware/authMiddleware');
+const { requireShopContext } = require('../middleware/shopContextMiddleware');
+
+router.use(requireAuth);
+router.use(requireShopContext);
+
+const MAX_IMAGES = 3;
+const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
+const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+function normalizeRoleKey(role) {
+  return String(role || '')
+    .trim()
+    .toLowerCase();
+}
+
+async function isShopAdminForRequest(req) {
+  if (isElevatedRole(req.user?.role)) return true;
+
+  try {
+    const uidResult = await db.query(
+      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+      [req.user.user_id]
+    );
+    const profileId = uidResult.rows[0]?.zb_profile_id;
+    if (!profileId) return false;
+
+    const mem = await db.query(
+      `SELECT role::text AS role FROM shop_users WHERE shop_id = $1::uuid AND user_id = $2::uuid`,
+      [req.shopId, profileId]
+    );
+    const m = normalizeRoleKey(mem.rows[0]?.role);
+    if (m === 'owner' || m === 'admin') return true;
+
+    const shopOwner = await db.query(
+      `SELECT owner_id::text AS oid FROM public.shops WHERE id = $1::uuid`,
+      [req.shopId]
+    );
+    const oid = shopOwner.rows[0]?.oid;
+    return oid && String(oid).toLowerCase() === String(profileId).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function stripBase64Payload(data) {
+  const raw = String(data || '').trim();
+  if (!raw) return '';
+  const idx = raw.indexOf('base64,');
+  if (idx >= 0) return raw.slice(idx + 7);
+  return raw;
+}
+
+function estimateBase64Bytes(b64) {
+  return Math.floor((b64.length * 3) / 4);
+}
+
+function parseImages(images) {
+  if (!Array.isArray(images)) return [];
+  const out = [];
+  for (let i = 0; i < Math.min(images.length, MAX_IMAGES); i += 1) {
+    const row = images[i] || {};
+    const mime = String(row.mime_type || row.mimeType || 'image/jpeg')
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_MIME.has(mime)) {
+      throw new Error(`Image ${i + 1}: only JPEG, PNG, WebP or GIF allowed`);
+    }
+    const payload = stripBase64Payload(row.data_base64 || row.dataBase64 || row.data);
+    if (!payload) continue;
+    const bytes = estimateBase64Bytes(payload);
+    if (bytes > MAX_IMAGE_BYTES) {
+      throw new Error(`Image ${i + 1} is too large (max 1.5 MB each)`);
+    }
+    out.push({
+      file_name: String(row.file_name || row.fileName || `screenshot-${i + 1}.jpg`).slice(0, 200),
+      mime_type: mime,
+      image_data: payload,
+      sort_order: i,
+    });
+  }
+  return out;
+}
+
+async function nextTicketNumber(client, shopId) {
+  const r = await client.query(
+    `SELECT ticket_number FROM support_tickets
+     WHERE shop_id = $1 AND ticket_number ~ '^ST-[0-9]+$'
+     ORDER BY ticket_id DESC LIMIT 1`,
+    [shopId]
+  );
+  let n = 0;
+  if (r.rows[0]?.ticket_number) {
+    const m = String(r.rows[0].ticket_number).match(/^ST-(\d+)$/i);
+    if (m) n = parseInt(m[1], 10);
+  }
+  return `ST-${String(n + 1).padStart(5, '0')}`;
+}
+
+function mapListRow(row) {
+  return {
+    ticket_id: row.ticket_id,
+    ticket_number: row.ticket_number,
+    heading: row.heading,
+    description: row.description,
+    status: row.status,
+    status_label: row.status === 'resolved' ? 'Resolved' : 'Not resolved',
+    created_by_user_id: row.created_by_user_id,
+    created_by_name: row.created_by_name,
+    created_by_role: row.created_by_role,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    resolved_at: row.resolved_at,
+    image_count: Number(row.image_count) || 0,
+  };
+}
+
+/** List tickets — shop admin: all in shop; cashier: own only */
+router.get('/', async (req, res) => {
+  try {
+    const adminView = await isShopAdminForRequest(req);
+    const params = [req.shopId];
+    let where = 't.shop_id = $1';
+    if (!adminView) {
+      params.push(req.user.user_id);
+      where += ` AND t.created_by_user_id = $${params.length}`;
+    }
+
+    const result = await db.query(
+      `SELECT t.*,
+              (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count
+       FROM support_tickets t
+       WHERE ${where}
+       ORDER BY t.created_at DESC, t.ticket_id DESC`,
+      params
+    );
+
+    res.json(result.rows.map(mapListRow));
+  } catch (error) {
+    if (error.code === '42P01') {
+      return res.status(503).json({
+        error: 'Support tickets not available',
+        message: 'Run database/migrations/017_support_tickets.sql in Supabase.',
+      });
+    }
+    console.error('[support-tickets] list', error);
+    res.status(500).json({ error: 'Failed to load support tickets', message: error.message });
+  }
+});
+
+/** Ticket detail + images */
+router.get('/:id', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (Number.isNaN(ticketId)) {
+      return res.status(400).json({ error: 'Invalid ticket id' });
+    }
+
+    const hdr = await db.query(
+      `SELECT t.*,
+              (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count
+       FROM support_tickets t
+       WHERE t.ticket_id = $1 AND t.shop_id = $2`,
+      [ticketId, req.shopId]
+    );
+    if (!hdr.rows.length) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    const row = hdr.rows[0];
+    const adminView = await isShopAdminForRequest(req);
+    if (!adminView && row.created_by_user_id !== req.user.user_id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const imgs = await db.query(
+      `SELECT image_id, file_name, mime_type, sort_order, created_at, image_data
+       FROM support_ticket_images
+       WHERE ticket_id = $1
+       ORDER BY sort_order ASC, image_id ASC`,
+      [ticketId]
+    );
+
+    const images = imgs.rows.map((img) => ({
+      image_id: img.image_id,
+      file_name: img.file_name,
+      mime_type: img.mime_type,
+      sort_order: img.sort_order,
+      data_url: `data:${img.mime_type};base64,${img.image_data}`,
+    }));
+
+    res.json({
+      ...mapListRow(row),
+      images,
+    });
+  } catch (error) {
+    if (error.code === '42P01') {
+      return res.status(503).json({
+        error: 'Support tickets not available',
+        message: 'Run database/migrations/017_support_tickets.sql in Supabase.',
+      });
+    }
+    console.error('[support-tickets] detail', error);
+    res.status(500).json({ error: 'Failed to load ticket', message: error.message });
+  }
+});
+
+/** Submit a new support ticket */
+router.post('/', async (req, res) => {
+  const client = await db.getClient();
+  try {
+    const heading = String(req.body?.heading || '').trim();
+    const description = String(req.body?.description || '').trim();
+    if (heading.length < 3) {
+      return res.status(400).json({ error: 'Problem heading is required (at least 3 characters).' });
+    }
+    if (description.length < 10) {
+      return res.status(400).json({ error: 'Problem description is required (at least 10 characters).' });
+    }
+
+    let imageRows;
+    try {
+      imageRows = parseImages(req.body?.images);
+    } catch (imgErr) {
+      return res.status(400).json({ error: imgErr.message });
+    }
+
+    const createdByName = String(req.user?.name || req.user?.username || 'User').trim();
+    const createdByRole = String(req.user?.role || 'staff').trim();
+
+    await client.query('BEGIN');
+    const ticketNumber = await nextTicketNumber(client, req.shopId);
+    const ins = await client.query(
+      `INSERT INTO support_tickets (
+         shop_id, ticket_number, created_by_user_id, created_by_name, created_by_role,
+         heading, description, status
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,'open')
+       RETURNING *`,
+      [
+        req.shopId,
+        ticketNumber,
+        req.user.user_id,
+        createdByName,
+        createdByRole,
+        heading,
+        description,
+      ]
+    );
+    const ticket = ins.rows[0];
+
+    for (const img of imageRows) {
+      await client.query(
+        `INSERT INTO support_ticket_images (ticket_id, file_name, mime_type, image_data, sort_order)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [ticket.ticket_id, img.file_name, img.mime_type, img.image_data, img.sort_order]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      ...mapListRow({ ...ticket, image_count: imageRows.length }),
+      message: `Support ticket ${ticketNumber} submitted.`,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error.code === '42P01') {
+      return res.status(503).json({
+        error: 'Support tickets not available',
+        message: 'Run database/migrations/017_support_tickets.sql in Supabase.',
+      });
+    }
+    console.error('[support-tickets] create', error);
+    res.status(500).json({ error: 'Failed to submit ticket', message: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+module.exports = router;

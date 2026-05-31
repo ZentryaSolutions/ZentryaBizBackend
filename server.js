@@ -61,6 +61,8 @@ app.use(
 const stripeWebhookHandler = require('./routes/stripeWebhook');
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 
+// Support tickets may include up to 3 base64 screenshots (register before default json limit)
+app.use('/api/support-tickets', express.json({ limit: '15mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -245,6 +247,7 @@ app.use('/api/otp', require('./routes/otp'));
 app.use('/api/shop-picker', require('./routes/shopPicker'));
 app.use('/api/daily-closing', require('./routes/dailyClosing'));
 app.use('/api/units', require('./routes/units'));
+app.use('/api/support-tickets', require('./routes/supportTickets'));
 
 // Catch-all route for React app (must be last, after all API routes)
 // This serves index.html for any non-API routes (React Router)
