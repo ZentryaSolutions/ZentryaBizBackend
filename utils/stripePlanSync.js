@@ -7,6 +7,7 @@ const db = require('../db');
 const { shopLimitForPlan } = require('../lib/planShopLimits');
 const { sendTransactionalEmail } = require('./transactionalMail');
 const { buildPlanPurchaseEmail } = require('./planPurchaseEmailContent');
+const { getAppBaseUrl } = require('./appBaseUrl');
 
 function getStripe() {
   const key = process.env.STRIPE_SECRET_KEY;
@@ -73,7 +74,7 @@ async function sendPlanPurchaseEmail({ to, plan, price, periodEnd }) {
   if (!email || !email.includes('@')) return;
 
   const appName = process.env.APP_NAME || 'Zentrya Biz';
-  const fe = String(process.env.APP_BASE_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  const fe = getAppBaseUrl();
   const shopsUrl = fe ? `${fe}/shops` : '';
 
   const amountLine = formatAmountFromPrice(price) || undefined;

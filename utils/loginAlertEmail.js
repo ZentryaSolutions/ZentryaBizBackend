@@ -6,6 +6,7 @@ const nodemailer = require('nodemailer');
 const msGraphMail = require('./msGraphMail');
 const { createLogoutAllToken } = require('./emailSecurityTokens');
 const { parseUserAgent } = require('./parseUserAgent');
+const { getAppBaseUrl } = require('./appBaseUrl');
 
 function escapeHtml(s) {
   return String(s ?? '')
@@ -74,11 +75,6 @@ function backendBaseFromReq(req) {
   return '';
 }
 
-function frontendBase() {
-  const v = process.env.APP_BASE_URL || process.env.FRONTEND_URL || '';
-  return String(v).replace(/\/$/, '');
-}
-
 /**
  * Notify user of a successful sign-in. Best-effort — failures are logged, not thrown to caller.
  * @param {import('express').Request} req
@@ -108,7 +104,7 @@ async function sendLoginAlertEmail(req, user) {
     console.warn('[loginAlertEmail] revoke token:', e.message);
   }
 
-  const fe = frontendBase();
+  const fe = getAppBaseUrl();
   const textLines = [
     `Hi ${name},`,
     '',
@@ -182,7 +178,7 @@ async function sendLoginAlertEmail(req, user) {
 }
 
 function getFrontendBaseUrl() {
-  return frontendBase();
+  return getAppBaseUrl();
 }
 
 module.exports = {

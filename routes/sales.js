@@ -21,6 +21,19 @@ const createNotification = notificationsModule.createNotification || (async () =
 router.use(requireAuth);
 router.use(requireShopContext);
 
+/** cash | card | transfer — how payment was received (not credit/split settlement). */
+function normalizePaymentMode(raw) {
+  const m = String(raw || 'cash').toLowerCase().trim();
+  if (m === 'bank' || m === 'transfer' || m === 'bank_transfer') return 'transfer';
+  if (m === 'card') return 'card';
+  return 'cash';
+}
+
+function withPaymentMode(sale) {
+  if (!sale) return sale;
+  return { ...sale, payment_mode: sale.payment_mode || 'cash' };
+}
+
 // Generate next invoice number (per shop) in Bill-0000X format
 async function generateInvoiceNumber(shopId) {
   try {
@@ -118,13 +131,7 @@ router.get('/', async (req, res) => {
     params.push(parseInt(limit, 10) || 100);
     
     const result = await db.query(query, params);
-    // Map payment_type to payment_mode for frontend consistency
-    const salesWithPaymentMode = result.rows.map(sale => ({
-      ...sale,
-      payment_mode: sale.payment_type || 'cash'
-    }));
-    
-    res.json(salesWithPaymentMode);
+    res.json(result.rows.map(withPaymentMode));
   } catch (error) {
     console.error('Error fetching sales:', error);
     res.status(500).json({ error: 'Failed to fetch sales', message: error.message });
@@ -192,10 +199,8 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Sale not found' });
     }
 
-    const sale = saleResult.rows[0];
-    // Map payment_type to payment_mode for frontend consistency
-    sale.payment_mode = sale.payment_type || 'cash';
-    
+    const sale = withPaymentMode(saleResult.rows[0]);
+
     // Use item_name_english if available, otherwise use product_name
     const items = itemsResult.rows.map(item => ({
       ...item,
@@ -215,7 +220,7 @@ router.get('/:id', async (req, res) => {
 
 // Create new sale/invoice
 router.post('/', async (req, res) => {
-  const { customer_id, customer_name, items, payment_type, paid_amount, discount, tax, sale_notes, notes } = req.body;
+  const { customer_id, customer_name, items, payment_type, payment_mode, paid_amount, discount, tax, sale_notes, notes } = req.body;
   const saleNotes = (sale_notes != null && sale_notes !== '') ? String(sale_notes).trim() : (notes != null ? String(notes).trim() : null);
 
   if (!items || !Array.isArray(items) || items.length === 0) {
@@ -347,32 +352,45 @@ router.post('/', async (req, res) => {
     }
 
     const paymentTypeToSave = settlementType;
-    
+    const paymentModeToSave = normalizePaymentMode(payment_mode);
+
     // Create sale record with user tracking — business calendar date (not raw UTC CURRENT_DATE)
     const userId = req.user?.user_id || null;
     const saleBusinessDate = await getBusinessTodayDateString(client);
-    const insertParams = [invoiceNumber, customer_id || null, customer_name || null, subtotal, discountAmount, taxAmount, grandTotal, paidAmount, paymentTypeToSave, totalProfit, userId, saleBusinessDate, req.shopId, saleNotes || null];
+    const insertBase = [invoiceNumber, customer_id || null, customer_name || null, subtotal, discountAmount, taxAmount, grandTotal, paidAmount, paymentTypeToSave, totalProfit, userId, saleBusinessDate, req.shopId];
     let saleResult;
-    // Any failed statement aborts the whole txn in Postgres. Use SAVEPOINT so a failed
-    // INSERT (e.g. missing `notes` column → 42703) can be recovered before retrying without notes.
+    // SAVEPOINT: retry without optional columns (notes, payment_mode) if migration not applied yet.
     await client.query('SAVEPOINT sp_sale_insert');
     try {
       saleResult = await client.query(
-        `INSERT INTO sales (invoice_number, customer_id, customer_name, subtotal, discount, tax, total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        `INSERT INTO sales (invoice_number, customer_id, customer_name, subtotal, discount, tax, total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes, payment_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING *`,
-        insertParams
+        [...insertBase, saleNotes || null, paymentModeToSave]
       );
       await client.query('RELEASE SAVEPOINT sp_sale_insert');
     } catch (e) {
       await client.query('ROLLBACK TO SAVEPOINT sp_sale_insert');
       if (e.code === '42703') {
-        saleResult = await client.query(
-          `INSERT INTO sales (invoice_number, customer_id, customer_name, subtotal, discount, tax, total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-           RETURNING *`,
-          insertParams.slice(0, 13)
-        );
+        try {
+          saleResult = await client.query(
+            `INSERT INTO sales (invoice_number, customer_id, customer_name, subtotal, discount, tax, total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id, notes)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             RETURNING *`,
+            [...insertBase, saleNotes || null]
+          );
+        } catch (e2) {
+          if (e2.code === '42703') {
+            saleResult = await client.query(
+              `INSERT INTO sales (invoice_number, customer_id, customer_name, subtotal, discount, tax, total_amount, paid_amount, payment_type, total_profit, created_by, date, shop_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+               RETURNING *`,
+              insertBase
+            );
+          } else {
+            throw e2;
+          }
+        }
       } else {
         throw e;
       }
@@ -461,10 +479,11 @@ router.post('/', async (req, res) => {
       )
     ]);
 
-    const saleData = saleResultFinal.rows[0];
-    // Map payment_type to payment_mode for frontend
-    saleData.payment_mode = saleData.payment_type || 'cash';
-    
+    const saleData = withPaymentMode({
+      ...saleResultFinal.rows[0],
+      payment_mode: saleResultFinal.rows[0].payment_mode || paymentModeToSave,
+    });
+
     res.status(201).json({
       ...saleData,
       items: itemsResult.rows
@@ -495,7 +514,7 @@ router.put('/:id', async (req, res) => {
     await client.query('BEGIN');
     
     const { id } = req.params;
-    const { items, payment_type, paid_amount, discount, tax, customer_id, customer_name } = req.body;
+    const { items, payment_type, payment_mode, paid_amount, discount, tax, customer_id, customer_name } = req.body;
     const userId = req.user?.user_id || null;
 
     // Get existing sale (this shop only)
@@ -677,9 +696,8 @@ router.put('/:id', async (req, res) => {
       )
     ]);
 
-    const saleData = saleResult.rows[0];
-    saleData.payment_mode = saleData.payment_type || 'cash';
-    
+    const saleData = withPaymentMode(saleResult.rows[0]);
+
     res.json({
       ...saleData,
       items: itemsResult.rows.map(item => ({

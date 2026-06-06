@@ -69,8 +69,13 @@ function requirePlanMin(minRank) {
   };
 }
 
-const requireProPlan = requirePlanMin(2);
-const requirePremiumPlan = requirePlanMin(3);
+/** Pro/Premium gates removed — all subscribed users can access these features. */
+function allowFeature(_req, _res, next) {
+  return next();
+}
+
+const requireProPlan = allowFeature;
+const requirePremiumPlan = allowFeature;
 
 module.exports = {
   planRank,

@@ -20,6 +20,7 @@ const {
 const { normalizeEmail } = require('../utils/emailOtpVerify');
 const { sendTransactionalEmail } = require('../utils/transactionalMail');
 const { buildStaffAddedEmail } = require('../utils/staffInviteEmailContent');
+const { getAppBaseUrl } = require('../utils/appBaseUrl');
 const { logAuditEvent, logSensitiveAccess } = require('../utils/auditLogger');
 const notificationsModule = require('./notifications');
 const createNotification = notificationsModule.createNotification || (async () => {});
@@ -579,7 +580,7 @@ router.post('/invitations', async (req, res) => {
       [token, email, name || null, userRole, req.shopId, req.user.user_id, expiresAt]
     );
 
-    const appBase = process.env.APP_BASE_URL || 'http://localhost:3000';
+    const appBase = getAppBaseUrl();
     const acceptUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}`;
     const rejectUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}&action=reject`;
     const roleLabel = userRole === 'administrator' ? 'Administrator' : 'Cashier';
