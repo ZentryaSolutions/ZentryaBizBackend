@@ -1,11 +1,17 @@
 function buildOtpEmailContent(code, purpose) {
   const appName = process.env.APP_NAME || 'Zentrya Biz';
-  const subject = `${appName} verification code`;
   let safePurpose = 'verify your request';
   if (purpose === 'signup') safePurpose = 'complete your signup';
   else if (purpose === 'reset') safePurpose = 'reset your password';
   else if (purpose === 'login') safePurpose = 'sign in to your account';
   else if (purpose === 'new_device') safePurpose = 'verify this browser or device';
+  else if (purpose === 'admin_login') safePurpose = 'sign in to the admin panel';
+  else if (purpose === 'admin_reset') safePurpose = 'reset your admin password';
+
+  const subject =
+    purpose === 'admin_login' || purpose === 'admin_reset'
+      ? `${appName} admin verification code`
+      : `${appName} verification code`;
 
   const text =
     `Your ${appName} verification code is: ${code}\n\n` +

@@ -1,6 +1,7 @@
 const db = require('../db');
 const { shopLimitForPlan } = require('../lib/planShopLimits');
 const { sendTransactionalEmail } = require('./transactionalMail');
+const { getAppBaseUrl } = require('./appBaseUrl');
 const { DEFAULT_TZ } = require('./businessDate');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -185,28 +186,96 @@ async function getShopPlanAccess(shopId) {
   return { ok: true, status };
 }
 
-function buildRenewalEmail({ plan, periodEnd, days }) {
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildRenewalEmail({ plan, periodEnd, days, displayName, billingUrl }) {
   const appName = process.env.APP_NAME || 'Zentrya Biz';
   const label = planLabel(plan);
   const endDate = new Date(periodEnd).toLocaleDateString('en-PK', { dateStyle: 'medium' });
-  const subject = `${appName}: ${label} plan renews in ${days} day${days === 1 ? '' : 's'}`;
+  const name = String(displayName || '').trim();
+  const greeting = name ? `Hi ${name},` : 'Hi there,';
+  const subject = `${appName}: Your ${label} plan renews in ${days} day${days === 1 ? '' : 's'}`;
+  const billingLink = billingUrl || (getAppBaseUrl() ? `${getAppBaseUrl()}/shops` : '');
+
   const text = [
-    `Your current plan is ${label}.`,
+    greeting,
     '',
-    `Your next payment is scheduled around ${endDate}.`,
-    `That is in ${days} day${days === 1 ? '' : 's'}.`,
+    `This is a friendly reminder that your ${label} plan on ${appName} is scheduled to renew soon.`,
     '',
-    'If you need to change or cancel your plan, open Billing in your account before the renewal date.',
+    `Plan: ${label}`,
+    `Renewal date: ${endDate} (in ${days} day${days === 1 ? '' : 's'})`,
+    '',
+    'Your subscription will continue automatically unless you change or cancel it before the renewal date.',
+    billingLink ? `Manage billing: ${billingLink}` : 'Open My Shops → Billing to manage your subscription.',
+    '',
+    'Thank you for choosing Zentrya Biz.',
+    '',
+    '— The Zentrya Biz Team',
   ].join('\n');
+
   const html = `
-    <div style="font-family:Arial,sans-serif;background:#f8fafc;padding:24px">
-      <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:24px;color:#0f172a">
-        <h2 style="margin:0 0 12px;font-size:20px">${label} plan renewal reminder</h2>
-        <p style="margin:0 0 12px;line-height:1.6">Your current plan is <strong>${label}</strong>.</p>
-        <p style="margin:0 0 12px;line-height:1.6">Your next payment is scheduled around <strong>${endDate}</strong>, in <strong>${days} day${days === 1 ? '' : 's'}</strong>.</p>
-        <p style="margin:0;color:#475569;line-height:1.6">Open Billing before the renewal date if you want to change or cancel your plan.</p>
-      </div>
-    </div>`;
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f3ef;font-family:system-ui,-apple-system,Segoe UI,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f4f3ef;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 8px 32px rgba(15,23,42,.08);">
+        <tr>
+          <td style="background:linear-gradient(135deg,#1e1b4b 0%,#4f46e5 100%);padding:28px 32px;color:#fff;">
+            <div style="font-size:13px;opacity:.85;letter-spacing:.06em;text-transform:uppercase;">Subscription reminder</div>
+            <div style="font-size:24px;font-weight:800;margin-top:8px;">${escapeHtml(label)} plan renewal</div>
+            <div style="font-size:14px;opacity:.9;margin-top:6px;">${escapeHtml(appName)}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px;color:#1e293b;">
+            <p style="margin:0 0 16px;font-size:16px;line-height:1.6;">${escapeHtml(greeting)}</p>
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.65;color:#334155;">
+              Your <strong>${escapeHtml(label)}</strong> plan is scheduled to renew on
+              <strong>${escapeHtml(endDate)}</strong> — that is <strong>${days} day${days === 1 ? '' : 's'}</strong> from now.
+            </p>
+            <table role="presentation" width="100%" style="background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;margin-bottom:20px;">
+              <tr><td style="padding:16px 20px;">
+                <div style="font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;">Current plan</div>
+                <div style="font-size:20px;font-weight:800;color:#4f46e5;margin-top:4px;">${escapeHtml(label)}</div>
+                <div style="margin-top:14px;font-size:13px;color:#64748b;">Next billing date</div>
+                <div style="font-size:16px;font-weight:700;margin-top:4px;color:#334155;">${escapeHtml(endDate)}</div>
+              </td></tr>
+            </table>
+            <p style="margin:0 0 8px;font-size:14px;line-height:1.65;color:#475569;">
+              Your subscription will renew automatically. To update your payment method, change your plan, or cancel before renewal, open Billing in your account.
+            </p>
+            ${
+              billingLink
+                ? `<p style="margin:24px 0 0;text-align:center;">
+              <a href="${escapeHtml(billingLink)}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:14px 28px;border-radius:10px;">Manage billing</a>
+            </p>`
+                : ''
+            }
+            <p style="margin:28px 0 0;font-size:14px;line-height:1.6;color:#64748b;">
+              Thank you for trusting ${escapeHtml(appName)} with your business.
+            </p>
+            <p style="margin:12px 0 0;font-size:14px;color:#334155;font-weight:600;">— The Zentrya Biz Team</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 32px 24px;font-size:12px;color:#94a3b8;text-align:center;border-top:1px solid #f1f5f9;">
+            You received this email because you have an active ${escapeHtml(label)} subscription.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`.trim();
+
   return { subject, text, html };
 }
 
@@ -220,7 +289,8 @@ async function maybeSendPlanRenewalReminder(profileId) {
             p.stripe_current_period_end,
             p.plan_reminder_period_end,
             z.email,
-            z.username
+            z.username,
+            z.full_name
        FROM public.profiles p
        LEFT JOIN public.zb_simple_users z ON z.id = p.id
       WHERE p.id = $1::uuid
@@ -246,7 +316,10 @@ async function maybeSendPlanRenewalReminder(profileId) {
   const to = String(row.email || row.username || '').trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return { sent: false };
 
-  const email = buildRenewalEmail({ plan, periodEnd, days });
+  const displayName = String(row.full_name || '').trim() || String(row.username || '').split('@')[0] || '';
+  const fe = getAppBaseUrl();
+  const billingUrl = fe ? `${fe}/shops` : '';
+  const email = buildRenewalEmail({ plan, periodEnd, days, displayName, billingUrl });
   await sendTransactionalEmail({ to, ...email });
   await db.query(
     `UPDATE public.profiles
@@ -294,6 +367,7 @@ async function sendDuePlanRenewalReminders({ limit = 100 } = {}) {
 
 module.exports = {
   TRIAL_DAYS,
+  planLabel,
   ensurePlanLifecycleColumns,
   refreshPlanLifecycleForProfile,
   getShopPlanAccess,

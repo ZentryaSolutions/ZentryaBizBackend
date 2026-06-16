@@ -28,7 +28,7 @@ async function validateEmailOtpMatch(emailRaw, codeRaw, purpose) {
   if (!/^\d{6}$/.test(code)) {
     return { ok: false, error: 'Invalid code' };
   }
-  if (!['signup', 'login', 'reset', 'new_device'].includes(p)) {
+  if (!['signup', 'login', 'reset', 'new_device', 'admin_login', 'admin_reset'].includes(p)) {
     return { ok: false, error: 'Invalid purpose' };
   }
 

@@ -274,7 +274,7 @@ async function resolveZbSimpleLogin(username, password) {
       status: 401,
       body: {
         error: 'Invalid credentials',
-        message: 'Zentrya username/password not found or incorrect',
+        message: 'Email or Password incorrect',
       },
     };
   }

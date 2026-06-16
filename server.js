@@ -28,7 +28,7 @@ function handleCorsPreflight(req, res, next) {
   res.setHeader(
     'Access-Control-Allow-Headers',
     acrh ||
-      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, x-offline-replay, Accept, Accept-Language, X-Requested-With'
+      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, x-admin-session-id, x-platform-admin-session, x-offline-replay, Accept, Accept-Language, X-Requested-With'
   );
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -49,6 +49,8 @@ app.use(
       'x-device-id',
       'x-session-id',
       'x-shop-id',
+      'x-admin-session-id',
+      'x-platform-admin-session',
       'x-offline-replay',
       'Accept',
       'Accept-Language',
@@ -304,7 +306,7 @@ function applyCorsPreflightHeaders(req, res) {
   res.setHeader(
     'Access-Control-Allow-Headers',
     acrh ||
-      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, x-offline-replay, Accept, Accept-Language, X-Requested-With'
+      'Content-Type, Authorization, x-device-id, x-session-id, x-shop-id, x-admin-session-id, x-platform-admin-session, x-offline-replay, Accept, Accept-Language, X-Requested-With'
   );
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
   res.setHeader('Access-Control-Max-Age', '86400');
