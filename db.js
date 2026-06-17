@@ -5,7 +5,8 @@
 const dns = require('dns');
 const { Pool } = require('pg');
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { loadBackendEnv } = require('./loadEnv');
+loadBackendEnv();
 
 /** Optional: comma-separated DNS servers (e.g. 8.8.8.8,1.1.1.1) if `db.*.supabase.co` fails to resolve. */
 if (process.env.DB_DNS_SERVERS) {

@@ -25,6 +25,18 @@ function buildSmtpTransport() {
   });
 }
 
+function isTransactionalEmailConfigured() {
+  if (msGraphMail.isConfigured()) return true;
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  return Boolean(
+    from &&
+      process.env.SMTP_HOST &&
+      process.env.SMTP_PORT &&
+      process.env.SMTP_USER &&
+      process.env.SMTP_PASS
+  );
+}
+
 /**
  * @param {{ to: string, subject: string, text: string, html?: string, attachments?: Array<{filename:string,content:Buffer|string,contentType?:string,cid?:string}> }} opts
  */
@@ -47,4 +59,4 @@ async function sendTransactionalEmail(opts) {
   await transport.sendMail({ from, to, subject, text, html: html || text, attachments });
 }
 
-module.exports = { sendTransactionalEmail };
+module.exports = { sendTransactionalEmail, isTransactionalEmailConfigured };

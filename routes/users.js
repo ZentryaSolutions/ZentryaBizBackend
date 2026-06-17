@@ -18,8 +18,8 @@ const {
   validatePassword, 
 } = require('../utils/authUtils');
 const { normalizeEmail } = require('../utils/emailOtpVerify');
-const { sendTransactionalEmail } = require('../utils/transactionalMail');
-const { buildStaffAddedEmail } = require('../utils/staffInviteEmailContent');
+const { sendTransactionalEmail, isTransactionalEmailConfigured } = require('../utils/transactionalMail');
+const { buildStaffAddedEmail, buildStaffInvitationEmail } = require('../utils/staffInviteEmailContent');
 const { getAppBaseUrl } = require('../utils/appBaseUrl');
 const { logAuditEvent, logSensitiveAccess } = require('../utils/auditLogger');
 const notificationsModule = require('./notifications');
@@ -48,6 +48,39 @@ function isValidStaffEmail(s) {
   const e = normalizeEmail(s);
   if (!e || e.length > 254) return false;
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+function loadInvitationLogoAttachments(logoCid) {
+  try {
+    const logoPath = path.resolve(__dirname, '../../frontend/public/companylogo.jpeg');
+    if (fs.existsSync(logoPath)) {
+      const content = fs.readFileSync(logoPath);
+      return [{ filename: 'companylogo.jpeg', content, contentType: 'image/jpeg', cid: logoCid }];
+    }
+  } catch (_) {
+    /* logo attachment optional */
+  }
+  return [];
+}
+
+async function deliverStaffInvitationEmail({ email, token, storeName, userRole }) {
+  const appBase = getAppBaseUrl();
+  const acceptUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}`;
+  const rejectUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}&action=reject`;
+  const roleLabel = userRole === 'administrator' ? 'Administrator' : 'Cashier';
+  const { subject, text, html, logoCid } = buildStaffInvitationEmail({
+    storeName,
+    roleLabel,
+    acceptUrl,
+    rejectUrl,
+  });
+  const attachments = loadInvitationLogoAttachments(logoCid);
+  await sendTransactionalEmail({ to: email, subject, text, html, attachments });
+  return { acceptUrl };
+}
+
+function isDevWithoutProductionEmail() {
+  return process.env.NODE_ENV !== 'production' && process.env.VERCEL !== '1';
 }
 
 /** Keep zb_simple_users password (crypt) in sync with users (bcrypt) when staff logs in via email + Supabase zb_login. */
@@ -554,16 +587,6 @@ router.post('/invitations', async (req, res) => {
       return res.status(400).json({ error: 'Invalid email', message: 'Enter a valid email address' });
     }
 
-    const dup = await db.query(
-      `SELECT invitation_id FROM staff_invitations
-       WHERE lower(trim(email)) = $1 AND shop_id = $2::uuid AND status = 'pending' AND expires_at > NOW()
-       LIMIT 1`,
-      [email, req.shopId]
-    );
-    if (dup.rows.length > 0) {
-      return res.status(400).json({ error: 'Invitation exists', message: 'A pending invitation already exists for this email' });
-    }
-
     let storeName = 'your store';
     try {
       const sr = await db.query(`SELECT name FROM public.shops WHERE id = $1::uuid`, [req.shopId]);
@@ -572,70 +595,70 @@ router.post('/invitations', async (req, res) => {
       /* optional */
     }
 
-    const token = crypto.randomBytes(24).toString('hex');
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 2); // 48h
-    await db.query(
-      `INSERT INTO staff_invitations (token, email, name, role, shop_id, invited_by_user_id, status, expires_at)
-       VALUES ($1, $2, $3, $4, $5::uuid, $6, 'pending', $7)`,
-      [token, email, name || null, userRole, req.shopId, req.user.user_id, expiresAt]
+    const pending = await db.query(
+      `SELECT invitation_id, token FROM staff_invitations
+       WHERE lower(trim(email)) = $1 AND shop_id = $2::uuid AND status = 'pending' AND expires_at > NOW()
+       LIMIT 1`,
+      [email, req.shopId]
     );
+
+    let token;
+    let createdNewInvitation = false;
+    if (pending.rows.length > 0) {
+      token = pending.rows[0].token;
+      const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 2);
+      await db.query(
+        `UPDATE staff_invitations
+         SET name = COALESCE($2, name), role = $3, invited_by_user_id = $4, expires_at = $5
+         WHERE invitation_id = $1`,
+        [pending.rows[0].invitation_id, name || null, userRole, req.user.user_id, expiresAt]
+      );
+    } else {
+      token = crypto.randomBytes(24).toString('hex');
+      const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 2);
+      await db.query(
+        `INSERT INTO staff_invitations (token, email, name, role, shop_id, invited_by_user_id, status, expires_at)
+         VALUES ($1, $2, $3, $4, $5::uuid, $6, 'pending', $7)`,
+        [token, email, name || null, userRole, req.shopId, req.user.user_id, expiresAt]
+      );
+      createdNewInvitation = true;
+    }
 
     const appBase = getAppBaseUrl();
     const acceptUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}`;
-    const rejectUrl = `${appBase}/staff-invite?token=${encodeURIComponent(token)}&action=reject`;
-    const roleLabel = userRole === 'administrator' ? 'Administrator' : 'Cashier';
-    const subject = `Invitation to join ${storeName}`;
-    const text = [
-      `You have been invited as ${roleLabel} for ${storeName}.`,
-      '',
-      `Accept invitation: ${acceptUrl}`,
-      `Reject invitation: ${rejectUrl}`,
-      '',
-      'This invitation expires in 48 hours.',
-    ].join('\n');
-    const logoCid = 'zentrya-company-logo';
-    let attachments = [];
-    try {
-      const logoPath = path.resolve(__dirname, '../../frontend/public/companylogo.jpeg');
-      if (fs.existsSync(logoPath)) {
-        const content = fs.readFileSync(logoPath);
-        attachments = [{ filename: 'companylogo.jpeg', content, contentType: 'image/jpeg', cid: logoCid }];
+
+    if (!isTransactionalEmailConfigured()) {
+      if (isDevWithoutProductionEmail()) {
+        console.warn('[Users] Email not configured — share invitation link manually:', acceptUrl);
+        return res.json({
+          success: true,
+          message: 'Invitation created. Email is not configured locally — copy the invite link and share it with staff.',
+          inviteUrl: acceptUrl,
+          emailed: false,
+          email,
+        });
       }
-    } catch (_) {
-      /* logo attachment optional */
+      if (createdNewInvitation) {
+        await db.query(`DELETE FROM staff_invitations WHERE token = $1`, [token]);
+      }
+      return res.status(503).json({
+        error: 'Email not configured',
+        message: 'Invitation email cannot be sent. Configure MS Graph (MS_GRAPH_*) or SMTP on the server.',
+      });
     }
-    const html = `
-      <div style="margin:0;padding:18px;background:#eef2ff;font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a">
-        <div style="max-width:620px;margin:0 auto;background:linear-gradient(145deg,#ffffff,#f8faff);border:1px solid #dde5ff;border-radius:16px;overflow:hidden;box-shadow:0 10px 28px rgba(30,41,59,.12)">
-          <div style="padding:16px 18px;background:linear-gradient(90deg,#4f46e5,#6366f1);color:#fff">
-            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse">
-              <tr>
-                <td width="56" valign="middle" style="width:56px;vertical-align:middle;padding-right:10px">
-                  <img src="cid:${logoCid}" alt="Zentrya Biz" width="44" height="44" style="display:block;width:44px;height:44px;border-radius:10px;border:1px solid rgba(255,255,255,.45);background:#fff" />
-                </td>
-                <td valign="middle" style="vertical-align:middle">
-                  <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.9;line-height:1.3">Zentrya Biz</div>
-                  <div style="font-size:20px;font-weight:800;line-height:1.25;margin-top:2px">Store Team Invitation</div>
-                </td>
-              </tr>
-            </table>
-          </div>
-          <div style="padding:18px">
-            <p style="margin:0 0 10px;font-size:15px;color:#334155">You have been invited as <strong>${roleLabel}</strong> for <strong>${storeName}</strong>.</p>
-            <p style="margin:0 0 14px;color:#475467">Join your team to start billing, inventory, and daily sales workflows.</p>
-            <div style="margin:16px 0">
-              <a href="${acceptUrl}" style="display:inline-block;padding:11px 16px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:10px;margin-right:8px;font-weight:700">Accept</a>
-              <a href="${rejectUrl}" style="display:inline-block;padding:11px 16px;background:#fff;color:#b42318;text-decoration:none;border:1px solid #fecaca;border-radius:10px;font-weight:600">Reject</a>
-            </div>
-            <div style="margin:12px 0;padding:10px 12px;background:#eef4ff;border:1px solid #dbe5ff;border-radius:10px;color:#1e3a8a;font-size:13px">
-              Already registered on this app? Click <strong>Accept</strong> and choose <strong>Yes</strong> on next page.
-            </div>
-            <p style="margin:10px 0 0;font-size:12px;color:#667085">This invitation expires in 48 hours.</p>
-          </div>
-        </div>
-      </div>
-    `;
-    await sendTransactionalEmail({ to: email, subject, text, html, attachments });
+
+    try {
+      await deliverStaffInvitationEmail({ email, token, storeName, userRole });
+    } catch (mailErr) {
+      if (createdNewInvitation) {
+        await db.query(`DELETE FROM staff_invitations WHERE token = $1`, [token]);
+      }
+      console.error('[Users Route] Invitation email failed:', mailErr);
+      return res.status(502).json({
+        error: 'Failed to send invitation email',
+        message: mailErr.message || 'Could not send invitation email. Check SMTP / MS Graph settings.',
+      });
+    }
 
     await createNotification({
       userId: req.user.user_id,
@@ -646,7 +669,13 @@ router.post('/invitations', async (req, res) => {
       shopId: req.shopId,
     });
 
-    res.json({ success: true, message: 'Invitation sent successfully' });
+    res.json({
+      success: true,
+      message: 'Invitation sent successfully',
+      emailed: true,
+      email,
+      inviteUrl: acceptUrl,
+    });
   } catch (error) {
     console.error('[Users Route] Send invitation error:', error);
     res.status(500).json({
