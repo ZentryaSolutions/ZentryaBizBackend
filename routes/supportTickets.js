@@ -114,8 +114,49 @@ function mapListRow(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     resolved_at: row.resolved_at,
+    resolved_by_user_id: row.resolved_by_user_id,
+    resolved_by_name: row.resolved_by_name || '',
+    resolved_by_role: row.resolved_by_role || '',
     image_count: Number(row.image_count) || 0,
+    message_count: Number(row.message_count) || 0,
   };
+}
+
+function mapMessageRow(row) {
+  return {
+    message_id: row.message_id,
+    ticket_id: row.ticket_id,
+    sender_user_id: row.sender_user_id,
+    sender_name: row.sender_name,
+    sender_role: row.sender_role,
+    sender_kind: row.sender_kind,
+    body: row.body,
+    created_at: row.created_at,
+    is_mine: row.is_mine === true,
+  };
+}
+
+/** Load ticket in this shop; enforce cashier vs admin visibility */
+async function loadTicketForRequest(req, ticketId) {
+  const hdr = await db.query(
+    `SELECT t.*
+     FROM support_tickets t
+     WHERE t.ticket_id = $1 AND t.shop_id = $2`,
+    [ticketId, req.shopId]
+  );
+  if (!hdr.rows.length) {
+    const err = new Error('Ticket not found');
+    err.status = 404;
+    throw err;
+  }
+  const row = hdr.rows[0];
+  const adminView = await isShopAdminForRequest(req);
+  if (!adminView && Number(row.created_by_user_id) !== Number(req.user.user_id)) {
+    const err = new Error('Access denied');
+    err.status = 403;
+    throw err;
+  }
+  return row;
 }
 
 /** List tickets — shop admin: all in shop; cashier: own only */
@@ -131,7 +172,8 @@ router.get('/', async (req, res) => {
 
     const result = await db.query(
       `SELECT t.*,
-              (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count
+              (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count,
+              (SELECT COUNT(*)::int FROM support_ticket_messages m WHERE m.ticket_id = t.ticket_id) AS message_count
        FROM support_tickets t
        WHERE ${where}
        ORDER BY t.created_at DESC, t.ticket_id DESC`,
@@ -159,22 +201,7 @@ router.get('/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid ticket id' });
     }
 
-    const hdr = await db.query(
-      `SELECT t.*,
-              (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count
-       FROM support_tickets t
-       WHERE t.ticket_id = $1 AND t.shop_id = $2`,
-      [ticketId, req.shopId]
-    );
-    if (!hdr.rows.length) {
-      return res.status(404).json({ error: 'Ticket not found' });
-    }
-
-    const row = hdr.rows[0];
-    const adminView = await isShopAdminForRequest(req);
-    if (!adminView && row.created_by_user_id !== req.user.user_id) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const row = await loadTicketForRequest(req, ticketId);
 
     const imgs = await db.query(
       `SELECT image_id, file_name, mime_type, sort_order, created_at, image_data
@@ -193,10 +220,16 @@ router.get('/:id', async (req, res) => {
     }));
 
     res.json({
-      ...mapListRow(row),
+      ...mapListRow({ ...row, image_count: images.length }),
       images,
     });
   } catch (error) {
+    if (error.status === 404) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    if (error.status === 403) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
     if (error.code === '42P01') {
       return res.status(503).json({
         error: 'Support tickets not available',
@@ -279,5 +312,199 @@ router.post('/', async (req, res) => {
     client.release();
   }
 });
+
+/** Chat messages for one ticket (shop + ticket scoped) */
+router.get('/:id/messages', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (Number.isNaN(ticketId)) {
+      return res.status(400).json({ error: 'Invalid ticket id' });
+    }
+
+    await loadTicketForRequest(req, ticketId);
+
+    const result = await db.query(
+      `SELECT message_id, ticket_id, sender_user_id, sender_name, sender_role, sender_kind, body, created_at
+       FROM support_ticket_messages
+       WHERE ticket_id = $1 AND shop_id = $2
+       ORDER BY created_at ASC, message_id ASC`,
+      [ticketId, req.shopId]
+    );
+
+    const uid = req.user.user_id;
+    res.json(
+      result.rows.map((row) =>
+        mapMessageRow({
+          ...row,
+          is_mine: row.sender_user_id === uid && row.sender_kind === 'shop_staff',
+        })
+      )
+    );
+  } catch (error) {
+    if (error.status === 404) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    if (error.status === 403) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (error.code === '42P01') {
+      return res.status(503).json({
+        error: 'Support ticket chat not available',
+        message: 'Run database/migrations/020_support_ticket_messages.sql in Supabase.',
+      });
+    }
+    console.error('[support-tickets] messages list', error);
+    res.status(500).json({ error: 'Failed to load messages', message: error.message });
+  }
+});
+
+/** Post a chat message (shop staff only for now) */
+router.post('/:id/messages', async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (Number.isNaN(ticketId)) {
+      return res.status(400).json({ error: 'Invalid ticket id' });
+    }
+
+    const body = String(req.body?.body || '').trim();
+    if (body.length < 1) {
+      return res.status(400).json({ error: 'Message cannot be empty.' });
+    }
+    if (body.length > 4000) {
+      return res.status(400).json({ error: 'Message is too long (max 4000 characters).' });
+    }
+
+    await loadTicketForRequest(req, ticketId);
+
+    const senderName = String(req.user?.name || req.user?.username || 'User').trim();
+    const senderRole = String(req.user?.role || 'staff').trim();
+
+    const ins = await db.query(
+      `INSERT INTO support_ticket_messages (
+         ticket_id, shop_id, sender_user_id, sender_name, sender_role, sender_kind, body
+       ) VALUES ($1, $2, $3, $4, $5, 'shop_staff', $6)
+       RETURNING message_id, ticket_id, sender_user_id, sender_name, sender_role, sender_kind, body, created_at`,
+      [ticketId, req.shopId, req.user.user_id, senderName, senderRole, body]
+    );
+
+    res.status(201).json(
+      mapMessageRow({
+        ...ins.rows[0],
+        is_mine: true,
+      })
+    );
+  } catch (error) {
+    if (error.status === 404) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    if (error.status === 403) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (error.code === '42P01') {
+      return res.status(503).json({
+        error: 'Support ticket chat not available',
+        message: 'Run database/migrations/020_support_ticket_messages.sql in Supabase.',
+      });
+    }
+    console.error('[support-tickets] message create', error);
+    res.status(500).json({ error: 'Failed to send message', message: error.message });
+  }
+});
+
+/** Mark ticket resolved (or reopen) — same access rules as ticket detail */
+async function updateTicketStatusHandler(req, res) {
+  try {
+    const ticketId = parseInt(req.params.id, 10);
+    if (Number.isNaN(ticketId)) {
+      return res.status(400).json({ error: 'Invalid ticket id' });
+    }
+
+    const status = String(req.body?.status || 'resolved').trim().toLowerCase();
+    if (!['resolved', 'open'].includes(status)) {
+      return res.status(400).json({ error: 'Status must be resolved or open' });
+    }
+
+    await loadTicketForRequest(req, ticketId);
+
+    const resolverName = String(req.user?.name || req.user?.username || 'User').trim();
+    const resolverRole = String(req.user?.role || 'staff').trim();
+
+    let result;
+    try {
+      result = await db.query(
+        `UPDATE support_tickets
+            SET status = $1,
+                resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE NULL END,
+                resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END,
+                resolved_by_name = CASE WHEN $1 = 'resolved' THEN $3 ELSE NULL END,
+                resolved_by_role = CASE WHEN $1 = 'resolved' THEN $4 ELSE NULL END,
+                updated_at = now()
+          WHERE ticket_id = $5 AND shop_id = $6::uuid
+          RETURNING *`,
+        [status, req.user.user_id, resolverName, resolverRole, ticketId, req.shopId]
+      );
+    } catch (colErr) {
+      if (colErr.code === '42703') {
+        result = await db.query(
+          `UPDATE support_tickets
+              SET status = $1,
+                  resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE NULL END,
+                  resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END,
+                  updated_at = now()
+            WHERE ticket_id = $3 AND shop_id = $4::uuid
+            RETURNING *`,
+          [status, req.user.user_id, ticketId, req.shopId]
+        );
+      } else {
+        throw colErr;
+      }
+    }
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    const row = result.rows[0];
+    const imgs = await db.query(
+      `SELECT image_id, file_name, mime_type, sort_order, created_at, image_data
+       FROM support_ticket_images WHERE ticket_id = $1 ORDER BY sort_order ASC, image_id ASC`,
+      [ticketId]
+    );
+    const image_count = imgs.rows.length;
+    const images = imgs.rows.map((img) => ({
+      image_id: img.image_id,
+      file_name: img.file_name,
+      mime_type: img.mime_type,
+      sort_order: img.sort_order,
+      data_url: `data:${img.mime_type};base64,${img.image_data}`,
+    }));
+
+    res.json({
+      ...mapListRow({
+        ...row,
+        image_count,
+        resolved_by_name: row.resolved_by_name || (status === 'resolved' ? resolverName : ''),
+        resolved_by_role: row.resolved_by_role || (status === 'resolved' ? resolverRole : ''),
+      }),
+      images,
+      message: status === 'resolved' ? 'Ticket marked as resolved.' : 'Ticket reopened.',
+    });
+  } catch (error) {
+    if (error.status === 404) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+    if (error.status === 403) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    console.error('[support-tickets] status', error);
+    res.status(500).json({
+      error: error.message || 'Failed to update ticket status',
+      message: error.message,
+    });
+  }
+}
+
+router.patch('/:id/status', updateTicketStatusHandler);
+router.post('/:id/status', updateTicketStatusHandler);
 
 module.exports = router;
