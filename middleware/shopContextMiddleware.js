@@ -5,6 +5,7 @@
 
 const db = require('../db');
 const { getShopPlanAccess } = require('../utils/planLifecycle');
+const { shopVisibleToProfileSql } = require('../lib/shopMembership');
 
 function parseShopUuid(headerVal) {
   if (!headerVal || typeof headerVal !== 'string') return null;
@@ -40,7 +41,10 @@ async function requireShopContext(req, res, next) {
     }
 
     const mem = await db.query(
-      `SELECT 1 FROM shop_users WHERE user_id = $1::uuid AND shop_id = $2::uuid`,
+      `SELECT 1 FROM public.shops s
+        WHERE s.id = $2::uuid
+          AND ${shopVisibleToProfileSql('$1', 's')}
+        LIMIT 1`,
       [profileId, shopId]
     );
     if (mem.rows.length === 0) {

@@ -12,6 +12,10 @@ const { requireAuth } = require('../middleware/authMiddleware');
 const { getBusinessTodayDateString } = require('../utils/businessDate');
 const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimits');
 const {
+  shopVisibleToProfilesSql,
+  pruneFalseOwnerShopLinks,
+} = require('../lib/shopMembership');
+const {
   refreshPlanLifecycleForProfile,
   getShopPlanAccess,
   formatShopPlanAccessForViewer,
@@ -104,37 +108,11 @@ async function resolveProfileId(req) {
   return uidRow.rows[0]?.zb_profile_id || null;
 }
 
-/** Collect every profile UUID tied to this login (fixes legacy split zb_simple_users vs profiles ids). */
+/** Profile UUID for this login — one active profile per account. */
 async function resolveLinkedProfileIds(req) {
   const base = await resolveProfileId(req);
-  if (!base) return [];
-
-  const ids = new Set([String(base)]);
-
-  const linkRes = await db.query(
-    `SELECT DISTINCT x.id::text AS id
-       FROM (
-         SELECT u.zb_profile_id AS id
-           FROM users u
-          WHERE u.user_id = $1 AND u.is_active = true AND u.zb_profile_id IS NOT NULL
-         UNION
-         SELECT su.user_id AS id
-           FROM shop_users su
-          WHERE su.user_id = $2::uuid
-         UNION
-         SELECT s.owner_id AS id
-           FROM shops s
-          WHERE s.owner_id = $2::uuid
-       ) x
-      WHERE x.id IS NOT NULL`,
-    [req.user.user_id, base]
-  );
-  (linkRes.rows || []).forEach((r) => {
-    const id = String(r.id || '').trim();
-    if (UUID_RE.test(id)) ids.add(id);
-  });
-
-  return [...ids];
+  if (!base || !UUID_RE.test(String(base))) return [];
+  return [String(base)];
 }
 
 /** Ensure owner shops have shop_users rows for every linked profile id. */
@@ -225,13 +203,7 @@ router.get('/current-shop-plan', async (req, res) => {
               s.owner_id::text AS owner_id
          FROM public.shops s
         WHERE s.id = $1::uuid
-          AND (
-            s.owner_id = ANY($2::uuid[])
-            OR EXISTS (
-              SELECT 1 FROM public.shop_users su
-               WHERE su.shop_id = s.id AND su.user_id = ANY($2::uuid[])
-            )
-          )
+          AND ${shopVisibleToProfilesSql('$2', 's')}
         LIMIT 1`,
       [shopId, profileIds]
     );
@@ -317,13 +289,7 @@ router.get('/shop-access/:shopId', async (req, res) => {
     const mem = await db.query(
       `SELECT 1 FROM public.shops s
         WHERE s.id = $1::uuid
-          AND (
-            s.owner_id = ANY($2::uuid[])
-            OR EXISTS (
-              SELECT 1 FROM public.shop_users su
-               WHERE su.shop_id = s.id AND su.user_id = ANY($2::uuid[])
-            )
-          )
+          AND ${shopVisibleToProfilesSql('$2', 's')}
         LIMIT 1`,
       [shopId, profileIds]
     );
@@ -372,13 +338,7 @@ router.post('/shop-plan-access', async (req, res) => {
       `SELECT s.id::text AS id, s.owner_id::text AS owner_id
          FROM public.shops s
         WHERE s.id = ANY($2::uuid[])
-          AND (
-            s.owner_id = ANY($1::uuid[])
-            OR EXISTS (
-              SELECT 1 FROM public.shop_users su
-               WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
-            )
-          )`,
+          AND ${shopVisibleToProfilesSql('$1', 's')}`,
       [profileIds, shopIds]
     );
 
@@ -406,6 +366,7 @@ router.get('/my-shops', async (req, res) => {
       await refreshPlanLifecycleForProfile(ownerId);
     }
 
+    await pruneFalseOwnerShopLinks(db);
     await repairOwnerShopLinks(profileIds);
 
     const listRes = await db.query(
@@ -418,25 +379,25 @@ router.get('/my-shops', async (req, res) => {
               s.city,
               s.currency,
               s.created_at,
-              COALESCE(
-                (SELECT su.role::text
-                   FROM public.shop_users su
-                  WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
-                  ORDER BY CASE su.role::text
-                    WHEN 'owner' THEN 0
-                    WHEN 'admin' THEN 1
-                    WHEN 'administrator' THEN 2
-                    ELSE 3
-                  END
-                  LIMIT 1),
-                'owner'
-              ) AS role
+              CASE
+                WHEN s.owner_id = ANY($1::uuid[]) THEN 'owner'
+                ELSE COALESCE(
+                  (SELECT su.role::text
+                     FROM public.shop_users su
+                    WHERE su.shop_id = s.id
+                      AND su.user_id = ANY($1::uuid[])
+                      AND lower(su.role::text) <> 'owner'
+                    ORDER BY CASE su.role::text
+                      WHEN 'admin' THEN 0
+                      WHEN 'administrator' THEN 1
+                      ELSE 2
+                    END
+                    LIMIT 1),
+                  'salesman'
+                )
+              END AS role
          FROM public.shops s
-        WHERE s.owner_id = ANY($1::uuid[])
-           OR EXISTS (
-             SELECT 1 FROM public.shop_users su
-              WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
-           )
+        WHERE ${shopVisibleToProfilesSql('$1', 's')}
         ORDER BY s.created_at DESC`,
       [profileIds]
     );
@@ -447,7 +408,7 @@ router.get('/my-shops', async (req, res) => {
       planAccess: accessByShop[String(row.id)] || { ok: true },
     }));
 
-    return res.json({ ok: true, shops, profileIds });
+    return res.json({ ok: true, shops });
   } catch (e) {
     console.error('[shop-picker] my-shops:', e);
     return res.status(500).json({ error: e.message || 'Failed to load shops' });
@@ -472,19 +433,14 @@ router.post('/quick-stats', async (req, res) => {
       return res.json({ ok: true, stats: {} });
     }
 
+    await pruneFalseOwnerShopLinks(db);
     await repairOwnerShopLinks(profileIds);
 
     const allowedRes = await db.query(
       `SELECT s.id::text AS shop_id
          FROM public.shops s
         WHERE s.id = ANY($2::uuid[])
-          AND (
-            s.owner_id = ANY($1::uuid[])
-            OR EXISTS (
-              SELECT 1 FROM public.shop_users su
-               WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
-            )
-          )`,
+          AND ${shopVisibleToProfilesSql('$1', 's')}`,
       [profileIds, shopIds]
     );
     const allowed = new Set((allowedRes.rows || []).map((r) => String(r.shop_id || '').trim()));
@@ -643,24 +599,21 @@ router.post('/create-shop', async (req, res) => {
 
       const shopRoleCandidates = ['owner', 'admin', 'administrator'];
       let linked = false;
-      for (const pid of profileIds) {
-        for (const roleTry of shopRoleCandidates) {
-          try {
-            await client.query(
-              `INSERT INTO public.shop_users (shop_id, user_id, role)
-               VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
-              [shopId, pid, roleTry]
-            );
+      for (const roleTry of shopRoleCandidates) {
+        try {
+          await client.query(
+            `INSERT INTO public.shop_users (shop_id, user_id, role)
+             VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
+            [shopId, ownerId, roleTry]
+          );
+          linked = true;
+          break;
+        } catch (e) {
+          if (e.code === '23505') {
             linked = true;
             break;
-          } catch (e) {
-            if (e.code === '23505') {
-              linked = true;
-              break;
-            }
           }
         }
-        if (linked) break;
       }
       if (!linked) {
         throw new Error('Could not link shop to owner');
