@@ -202,6 +202,92 @@ router.get('/plan-status', async (req, res) => {
 });
 
 /**
+ * Plan for the active shop (x-shop-id) — uses shop owner's profile, not the logged-in cashier.
+ */
+router.get('/current-shop-plan', async (req, res) => {
+  try {
+    const shopId = String(req.headers['x-shop-id'] || '').trim();
+    if (!UUID_RE.test(shopId)) {
+      return res.status(400).json({
+        error: 'Shop required',
+        message: 'Send header x-shop-id with the active shop UUID.',
+      });
+    }
+
+    const profileIds = await resolveLinkedProfileIds(req);
+    if (!profileIds.length) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    const shopRes = await db.query(
+      `SELECT s.id::text AS shop_id,
+              s.name AS shop_name,
+              s.owner_id::text AS owner_id
+         FROM public.shops s
+        WHERE s.id = $1::uuid
+          AND (
+            s.owner_id = ANY($2::uuid[])
+            OR EXISTS (
+              SELECT 1 FROM public.shop_users su
+               WHERE su.shop_id = s.id AND su.user_id = ANY($2::uuid[])
+            )
+          )
+        LIMIT 1`,
+      [shopId, profileIds]
+    );
+    if (!shopRes.rows.length) {
+      return res.status(403).json({ error: 'Shop access denied' });
+    }
+
+    const shopRow = shopRes.rows[0];
+    const ownerId = shopRow.owner_id;
+    const viewerId = await resolveProfileId(req);
+    const isShopOwner = Boolean(viewerId && String(ownerId) === String(viewerId));
+
+    const status = await refreshPlanLifecycleForProfile(ownerId);
+    const trial = computeTrialProgress(status);
+    const access = await getShopPlanAccess(shopId);
+    const planAccess = formatShopPlanAccessForViewer(access, isShopOwner);
+
+    let ownerName = null;
+    try {
+      const ownerRes = await db.query(
+        `SELECT COALESCE(NULLIF(trim(z.full_name), ''), NULLIF(trim(z.username), ''), z.email) AS owner_name
+           FROM public.zb_simple_users z
+          WHERE z.id = $1::uuid
+          LIMIT 1`,
+        [ownerId]
+      );
+      ownerName = ownerRes.rows[0]?.owner_name || null;
+    } catch (_) {
+      /* optional */
+    }
+
+    return res.json({
+      ok: true,
+      shop_id: shopRow.shop_id,
+      shop_name: shopRow.shop_name,
+      owner_id: ownerId,
+      owner_name: ownerName,
+      is_shop_owner: isShopOwner,
+      plan: status?.plan || 'trial',
+      shop_limit: status?.shop_limit,
+      trial_started_at: status?.trial_started_at || null,
+      trial_ends_at: status?.trial_ends_at || null,
+      trial_day: trial?.day ?? null,
+      trial_total: trial?.total ?? TRIAL_DAYS,
+      trial_days_left: trial?.daysLeft ?? null,
+      trial_expired: Boolean(trial?.expired),
+      plan_access: planAccess,
+      business_timezone: DEFAULT_TZ,
+    });
+  } catch (e) {
+    console.error('[shop-picker] current-shop-plan:', e);
+    return res.status(500).json({ error: e.message || 'Failed to load shop plan' });
+  }
+});
+
+/**
  * Verify owner plan allows opening a shop (trial not expired, etc.).
  */
 async function buildShopPlanAccessMap(shopRows, viewerProfileId) {
