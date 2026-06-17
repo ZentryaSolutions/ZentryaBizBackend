@@ -93,11 +93,51 @@ function computeTrialProgress(status, timeZone = DEFAULT_TZ) {
   return { day, total: TRIAL_DAYS, daysLeft, expired };
 }
 
+async function reconcileProfileShopLimit(profileId) {
+  if (!profileId || !db.isDatabaseConfigured()) return;
+  await db.query(
+    `UPDATE public.profiles
+        SET shop_limit = CASE lower(coalesce(plan::text, 'trial'))
+          WHEN 'expired' THEN 0
+          WHEN 'premium' THEN 99999
+          ELSE 1
+        END
+      WHERE id = $1::uuid`,
+    [profileId]
+  );
+}
+
+async function reconcileAllProfileShopLimits() {
+  if (!db.isDatabaseConfigured()) return;
+  await db.query(
+    `UPDATE public.profiles
+        SET shop_limit = CASE lower(coalesce(plan::text, 'trial'))
+          WHEN 'expired' THEN 0
+          WHEN 'premium' THEN 99999
+          ELSE 1
+        END
+      WHERE shop_limit IS DISTINCT FROM (
+        CASE lower(coalesce(plan::text, 'trial'))
+          WHEN 'expired' THEN 0
+          WHEN 'premium' THEN 99999
+          ELSE 1
+        END
+      )`
+  );
+}
+
+function isShopLimitConstraintError(err) {
+  const msg = String(err?.message || err?.detail || '');
+  return err?.code === '23514' || /profiles_shop_limit_check/i.test(msg);
+}
+
 async function ensurePlanLifecycleColumns() {
   if (lifecycleColumnsReady) return;
   if (lifecycleColumnsPromise) return lifecycleColumnsPromise;
 
   lifecycleColumnsPromise = (async () => {
+    await reconcileAllProfileShopLimits();
+
     await db.query(`
       ALTER TABLE public.profiles
         ADD COLUMN IF NOT EXISTS trial_started_at timestamptz,
@@ -106,13 +146,23 @@ async function ensurePlanLifecycleColumns() {
         ADD COLUMN IF NOT EXISTS plan_reminder_period_end timestamptz
     `);
 
-    await db.query(`
-      UPDATE public.profiles
-      SET trial_started_at = COALESCE(trial_started_at, now()),
-          trial_ends_at = COALESCE(trial_ends_at, COALESCE(trial_started_at, now()) + ($1::int * interval '1 day'))
-      WHERE lower(coalesce(plan::text, 'trial')) = 'trial'
-        AND (trial_started_at IS NULL OR trial_ends_at IS NULL)
-    `, [TRIAL_DAYS]);
+    const runTrialBackfill = () =>
+      db.query(
+        `UPDATE public.profiles
+            SET trial_started_at = COALESCE(trial_started_at, now()),
+                trial_ends_at = COALESCE(trial_ends_at, COALESCE(trial_started_at, now()) + ($1::int * interval '1 day'))
+          WHERE lower(coalesce(plan::text, 'trial')) = 'trial'
+            AND (trial_started_at IS NULL OR trial_ends_at IS NULL)`,
+        [TRIAL_DAYS]
+      );
+
+    try {
+      await runTrialBackfill();
+    } catch (e) {
+      if (!isShopLimitConstraintError(e)) throw e;
+      await reconcileAllProfileShopLimits();
+      await runTrialBackfill();
+    }
 
     lifecycleColumnsReady = true;
   })().finally(() => {
@@ -125,18 +175,44 @@ async function ensurePlanLifecycleColumns() {
 async function expireTrialIfNeeded(profileId) {
   if (!profileId || !db.isDatabaseConfigured()) return null;
   await ensurePlanLifecycleColumns();
+  await reconcileProfileShopLimit(profileId);
 
-  const expired = await db.query(
-    `UPDATE public.profiles
-        SET plan = 'expired'::public.zb_plan,
-            shop_limit = 0
-      WHERE id = $1::uuid
-        AND lower(coalesce(plan::text, 'trial')) = 'trial'
-        AND COALESCE(trial_ends_at, trial_started_at + ($2::int * interval '1 day'), now() + interval '14 days') <= now()
-      RETURNING id::text, plan::text AS plan, shop_limit, trial_started_at, trial_ends_at,
-                stripe_current_period_end, plan_reminder_period_end`,
-    [profileId, TRIAL_DAYS]
-  );
+  const runExpire = () =>
+    db.query(
+      `UPDATE public.profiles
+          SET plan = 'expired'::public.zb_plan,
+              shop_limit = 0
+        WHERE id = $1::uuid
+          AND lower(coalesce(plan::text, 'trial')) = 'trial'
+          AND COALESCE(trial_ends_at, trial_started_at + ($2::int * interval '1 day'), now() + interval '14 days') <= now()
+        RETURNING id::text, plan::text AS plan, shop_limit, trial_started_at, trial_ends_at,
+                  stripe_current_period_end, plan_reminder_period_end`,
+      [profileId, TRIAL_DAYS]
+    );
+
+  let expired;
+  try {
+    expired = await runExpire();
+  } catch (e) {
+    if (!isShopLimitConstraintError(e)) throw e;
+    await reconcileProfileShopLimit(profileId);
+    try {
+      expired = await runExpire();
+    } catch (e2) {
+      if (!isShopLimitConstraintError(e2)) throw e2;
+      // DB may still require shop_limit >= 1 — mark plan expired without zeroing limit.
+      expired = await db.query(
+        `UPDATE public.profiles
+            SET plan = 'expired'::public.zb_plan
+          WHERE id = $1::uuid
+            AND lower(coalesce(plan::text, 'trial')) = 'trial'
+            AND COALESCE(trial_ends_at, trial_started_at + ($2::int * interval '1 day'), now() + interval '14 days') <= now()
+          RETURNING id::text, plan::text AS plan, shop_limit, trial_started_at, trial_ends_at,
+                    stripe_current_period_end, plan_reminder_period_end`,
+        [profileId, TRIAL_DAYS]
+      );
+    }
+  }
 
   if (expired.rows[0]) return expired.rows[0];
   const current = await db.query(
@@ -151,7 +227,13 @@ async function expireTrialIfNeeded(profileId) {
 }
 
 async function refreshPlanLifecycleForProfile(profileId) {
-  return expireTrialIfNeeded(profileId);
+  try {
+    return await expireTrialIfNeeded(profileId);
+  } catch (e) {
+    if (!isShopLimitConstraintError(e)) throw e;
+    await reconcileProfileShopLimit(profileId);
+    return expireTrialIfNeeded(profileId);
+  }
 }
 
 async function getShopPlanAccess(shopId) {
@@ -169,7 +251,12 @@ async function getShopPlanAccess(shopId) {
   if (!ownerId) return { ok: true };
 
   const status = await refreshPlanLifecycleForProfile(ownerId);
-  if (normalizePlan(status?.plan) === 'expired' || Number(status?.shop_limit) <= 0) {
+  const plan = normalizePlan(status?.plan);
+  const trialEnded =
+    plan === 'trial' &&
+    status?.trial_ends_at &&
+    new Date(status.trial_ends_at).getTime() <= Date.now();
+  if (plan === 'expired' || trialEnded || Number(status?.shop_limit) <= 0) {
     return {
       ok: false,
       status: 402,
@@ -389,6 +476,8 @@ module.exports = {
   planLabel,
   ensurePlanLifecycleColumns,
   refreshPlanLifecycleForProfile,
+  reconcileProfileShopLimit,
+  reconcileAllProfileShopLimits,
   getShopPlanAccess,
   formatShopPlanAccessForViewer,
   STAFF_PLAN_EXPIRED_MESSAGE,
