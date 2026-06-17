@@ -155,15 +155,21 @@ router.use(requireAuth);
 router.use(requireAdministratorOrProfileOwner);
 router.use(requireShopContext);
 
-/** Users visible in this shop: Zentrya shop_users link OR users.shop_id (local cashier rows). */
+/** Users visible in this shop: shop_users membership; legacy cashiers without profile use users.shop_id only. */
 function usersInShopWhereClause(shopParam = '$1') {
   return `(
-    EXISTS (
-      SELECT 1 FROM shop_users su
-      WHERE su.shop_id = ${shopParam}::uuid
-        AND su.user_id = u.zb_profile_id
+    (
+      u.zb_profile_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM shop_users su
+        WHERE su.shop_id = ${shopParam}::uuid
+          AND su.user_id = u.zb_profile_id
+      )
     )
-    OR u.shop_id = ${shopParam}::uuid
+    OR (
+      u.zb_profile_id IS NULL
+      AND u.shop_id = ${shopParam}::uuid
+    )
   )`;
 }
 
@@ -172,13 +178,7 @@ async function userBelongsToShop(userId, shopId) {
     const r = await db.query(
       `SELECT 1 FROM users u
        WHERE u.user_id = $1
-         AND (
-           EXISTS (
-             SELECT 1 FROM shop_users su
-             WHERE su.shop_id = $2::uuid AND su.user_id = u.zb_profile_id
-           )
-           OR u.shop_id = $2::uuid
-         )`,
+         AND ${usersInShopWhereClause('$2')}`,
       [userId, shopId]
     );
     return r.rows.length > 0;
@@ -204,13 +204,7 @@ async function countActiveAdminsExceptInShop(excludeUserId, shopId) {
     const r = await db.query(
       `SELECT COUNT(*)::int AS c FROM users u
        WHERE u.role = 'administrator' AND u.is_active = true AND u.user_id != $1
-         AND (
-           EXISTS (
-             SELECT 1 FROM shop_users su
-             WHERE su.shop_id = $2::uuid AND su.user_id = u.zb_profile_id
-           )
-           OR u.shop_id = $2::uuid
-         )`,
+         AND ${usersInShopWhereClause('$2')}`,
       [excludeUserId, shopId]
     );
     return parseInt(r.rows[0].c, 10);
@@ -236,13 +230,7 @@ async function usernameTakenInShop(username, shopId) {
     const r = await db.query(
       `SELECT u.user_id FROM users u
        WHERE lower(trim(u.username)) = lower(trim($1))
-         AND (
-           EXISTS (
-             SELECT 1 FROM shop_users su
-             WHERE su.shop_id = $2::uuid AND su.user_id = u.zb_profile_id
-           )
-           OR u.shop_id = $2::uuid
-         )`,
+         AND ${usersInShopWhereClause('$2')}`,
       [username, shopId]
     );
     return r.rows.length > 0;

@@ -14,6 +14,7 @@ const { resolveShopLimit, isUnlimitedShopLimit } = require('../lib/planShopLimit
 const {
   refreshPlanLifecycleForProfile,
   getShopPlanAccess,
+  formatShopPlanAccessForViewer,
   computeTrialProgress,
   TRIAL_DAYS,
 } = require('../utils/planLifecycle');
@@ -124,10 +125,6 @@ async function resolveLinkedProfileIds(req) {
          SELECT s.owner_id AS id
            FROM shops s
           WHERE s.owner_id = $2::uuid
-             OR EXISTS (
-               SELECT 1 FROM shop_users su
-                WHERE su.shop_id = s.id AND su.user_id = $2::uuid
-             )
        ) x
       WHERE x.id IS NOT NULL`,
     [req.user.user_id, base]
@@ -173,30 +170,6 @@ async function repairOwnerShopLinks(profileIds) {
       }
     }
   }
-
-  // Legacy: owner_id may differ from shop_users.user_id — link all known profile ids to owned shops
-  const legacy = await db.query(
-    `SELECT s.id::text AS shop_id
-       FROM public.shops s
-      WHERE s.owner_id = ANY($1::uuid[])`,
-    [ids]
-  );
-  for (const row of legacy.rows || []) {
-    for (const pid of ids) {
-      for (const roleTry of shopRoleCandidates) {
-        try {
-          await db.query(
-            `INSERT INTO public.shop_users (shop_id, user_id, role)
-             VALUES ($1::uuid, $2::uuid, $3::public.zb_user_role)`,
-            [row.shop_id, pid, roleTry]
-          );
-          break;
-        } catch (e) {
-          if (e.code === '23505') break;
-        }
-      }
-    }
-  }
 }
 
 /**
@@ -231,20 +204,104 @@ router.get('/plan-status', async (req, res) => {
 /**
  * Verify owner plan allows opening a shop (trial not expired, etc.).
  */
+async function buildShopPlanAccessMap(shopRows, viewerProfileId) {
+  const out = {};
+  for (const row of shopRows || []) {
+    const shopId = String(row.id || '').trim();
+    if (!UUID_RE.test(shopId)) continue;
+    const access = await getShopPlanAccess(shopId);
+    const isOwner =
+      viewerProfileId && String(row.owner_id || '') === String(viewerProfileId);
+    out[shopId] = formatShopPlanAccessForViewer(access, isOwner);
+  }
+  return out;
+}
+
 router.get('/shop-access/:shopId', async (req, res) => {
   try {
     const shopId = String(req.params.shopId || '').trim();
     if (!UUID_RE.test(shopId)) {
       return res.status(400).json({ error: 'Invalid shop id' });
     }
+    const profileIds = await resolveLinkedProfileIds(req);
+    if (!profileIds.length) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    const mem = await db.query(
+      `SELECT 1 FROM public.shops s
+        WHERE s.id = $1::uuid
+          AND (
+            s.owner_id = ANY($2::uuid[])
+            OR EXISTS (
+              SELECT 1 FROM public.shop_users su
+               WHERE su.shop_id = s.id AND su.user_id = ANY($2::uuid[])
+            )
+          )
+        LIMIT 1`,
+      [shopId, profileIds]
+    );
+    if (!mem.rows.length) {
+      return res.status(403).json({ error: 'Shop access denied' });
+    }
+
+    const ownerRow = await db.query(
+      `SELECT owner_id::text AS owner_id FROM public.shops WHERE id = $1::uuid LIMIT 1`,
+      [shopId]
+    );
+    const viewerId = await resolveProfileId(req);
+    const isOwner =
+      viewerId && String(ownerRow.rows[0]?.owner_id || '') === String(viewerId);
+
     const access = await getShopPlanAccess(shopId);
     if (!access.ok) {
-      return res.status(access.status || 402).json(access.body || { error: 'Subscription expired' });
+      const body = formatShopPlanAccessForViewer(access, isOwner);
+      return res.status(access.status || 402).json({
+        error: 'Subscription expired',
+        ...body,
+      });
     }
     return res.json({ ok: true, plan: access.status?.plan || null });
   } catch (e) {
     console.error('[shop-picker] shop-access:', e);
     return res.status(500).json({ error: e.message || 'Failed to verify shop access' });
+  }
+});
+
+router.post('/shop-plan-access', async (req, res) => {
+  try {
+    const shopIds = normalizeShopUuidList(
+      Array.isArray(req.body?.shopIds) ? req.body.shopIds : []
+    ).slice(0, 50);
+    if (!shopIds.length) {
+      return res.json({ ok: true, access: {} });
+    }
+
+    const profileIds = await resolveLinkedProfileIds(req);
+    if (!profileIds.length) {
+      return res.status(403).json({ error: 'Profile not linked to this account.' });
+    }
+
+    const allowedRes = await db.query(
+      `SELECT s.id::text AS id, s.owner_id::text AS owner_id
+         FROM public.shops s
+        WHERE s.id = ANY($2::uuid[])
+          AND (
+            s.owner_id = ANY($1::uuid[])
+            OR EXISTS (
+              SELECT 1 FROM public.shop_users su
+               WHERE su.shop_id = s.id AND su.user_id = ANY($1::uuid[])
+            )
+          )`,
+      [profileIds, shopIds]
+    );
+
+    const viewerId = await resolveProfileId(req);
+    const access = await buildShopPlanAccessMap(allowedRes.rows || [], viewerId);
+    return res.json({ ok: true, access });
+  } catch (e) {
+    console.error('[shop-picker] shop-plan-access:', e);
+    return res.status(500).json({ error: e.message || 'Failed to load shop plan access' });
   }
 });
 
@@ -267,6 +324,7 @@ router.get('/my-shops', async (req, res) => {
 
     const listRes = await db.query(
       `SELECT s.id::text AS id,
+              s.owner_id::text AS owner_id,
               s.name,
               s.phone,
               s.address,
@@ -297,7 +355,13 @@ router.get('/my-shops', async (req, res) => {
       [profileIds]
     );
 
-    return res.json({ ok: true, shops: listRes.rows || [], profileIds });
+    const accessByShop = await buildShopPlanAccessMap(listRes.rows || [], ownerId);
+    const shops = (listRes.rows || []).map((row) => ({
+      ...row,
+      planAccess: accessByShop[String(row.id)] || { ok: true },
+    }));
+
+    return res.json({ ok: true, shops, profileIds });
   } catch (e) {
     console.error('[shop-picker] my-shops:', e);
     return res.status(500).json({ error: e.message || 'Failed to load shops' });

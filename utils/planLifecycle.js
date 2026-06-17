@@ -186,6 +186,25 @@ async function getShopPlanAccess(shopId) {
   return { ok: true, status };
 }
 
+const STAFF_PLAN_EXPIRED_MESSAGE =
+  'This shop\'s subscription has expired. Please contact your shop administrator to renew the plan.';
+
+/** UI/API payload for a shop plan check — owners see upgrade copy; staff see contact-admin copy. */
+function formatShopPlanAccessForViewer(access, isShopOwner) {
+  if (access?.ok) return { ok: true };
+  return {
+    ok: false,
+    plan: access?.body?.plan || 'expired',
+    message: isShopOwner
+      ? access?.body?.message ||
+        'Your 14-day trial or subscription has expired. Upgrade your plan to open this shop.'
+      : STAFF_PLAN_EXPIRED_MESSAGE,
+    contactAdmin: !isShopOwner,
+    upgrade: Boolean(isShopOwner),
+    trialEndsAt: access?.body?.trialEndsAt || null,
+  };
+}
+
 function escapeHtml(s) {
   return String(s || '')
     .replace(/&/g, '&amp;')
@@ -371,6 +390,8 @@ module.exports = {
   ensurePlanLifecycleColumns,
   refreshPlanLifecycleForProfile,
   getShopPlanAccess,
+  formatShopPlanAccessForViewer,
+  STAFF_PLAN_EXPIRED_MESSAGE,
   computeTrialProgress,
   maybeSendPlanRenewalReminder,
   sendDuePlanRenewalReminders,
