@@ -11,6 +11,11 @@ const {
   lineProfit,
   insertSaleItemRow,
 } = require('../lib/saleLineMath');
+const {
+  lockShopDocumentNumbers,
+  generateInvoiceNumber,
+  generateCreditNoteNumber,
+} = require('../lib/documentNumbers');
 const notificationsModule = require('./notifications');
 const createNotification = notificationsModule.createNotification || (async () => {
   // Fallback if createNotification is not available
@@ -48,48 +53,6 @@ function catalogPriceForProduct(product, priceType) {
 
 function pricesDiffer(a, b) {
   return Math.abs((parseFloat(a) || 0) - (parseFloat(b) || 0)) > 0.009;
-}
-
-// Generate next invoice number (per shop) in INV-YYYY-NNNN format
-async function generateInvoiceNumber(shopId, client) {
-  const q = client || db;
-  const year = new Date().getFullYear();
-  const prefix = `INV-${year}-`;
-
-  try {
-    const invResult = await q.query(
-      `SELECT COALESCE(MAX(
-         (regexp_match(invoice_number, 'INV-' || $2::text || '-(\\d+)', 'i'))[1]::int
-       ), 0) AS max_seq
-       FROM sales
-       WHERE shop_id = $1
-         AND invoice_number ~* ('^INV-' || $2::text || '-\\d+$')
-         AND lower(COALESCE(sale_kind, '')) <> 'return'
-         AND invoice_number NOT ILIKE 'CN-%'`,
-      [shopId, year]
-    );
-    let nextSeq = (parseInt(invResult.rows[0]?.max_seq, 10) || 0) + 1;
-
-    if (nextSeq <= 1) {
-      const billResult = await q.query(
-        `SELECT COALESCE(MAX(
-           (regexp_match(invoice_number, 'Bill-(\\d+)', 'i'))[1]::int
-         ), 0) AS max_seq
-         FROM sales
-         WHERE shop_id = $1
-           AND invoice_number ~* '^Bill-\\d+$'
-           AND lower(COALESCE(sale_kind, '')) <> 'return'`,
-        [shopId]
-      );
-      const billMax = parseInt(billResult.rows[0]?.max_seq, 10) || 0;
-      if (billMax > 0) nextSeq = billMax + 1;
-    }
-
-    return `${prefix}${String(nextSeq).padStart(4, '0')}`;
-  } catch (error) {
-    console.error('Error generating invoice number:', error);
-    return `${prefix}0001`;
-  }
 }
 
 // Get all sales
@@ -270,6 +233,7 @@ router.post('/', async (req, res) => {
 
   try {
     await client.query('BEGIN');
+    await lockShopDocumentNumbers(client, req.shopId);
 
     // If customer_id provided, verify it exists
     if (customer_id) {
@@ -963,24 +927,6 @@ async function insertReturnSaleRecord(client, baseWithNotes, baseNoNotes, origin
   );
 }
 
-async function generateCreditNoteNumber(shopId, client) {
-  const q = client || db;
-  const result = await q.query(
-    `SELECT invoice_number FROM sales
-     WHERE shop_id = $1 AND invoice_number ILIKE 'CN-%'
-     ORDER BY sale_id DESC LIMIT 1`,
-    [shopId]
-  );
-  if (!result.rows.length) return 'CN-00001';
-  const last = String(result.rows[0].invoice_number || '');
-  const match = last.match(/CN-(\d+)/i);
-  if (match) {
-    const next = parseInt(match[1], 10) + 1;
-    return `CN-${String(next).padStart(5, '0')}`;
-  }
-  return 'CN-00001';
-}
-
 function buildReturnNotes(originalInvoice, returnReason) {
   const reason = String(returnReason || '')
     .trim()
@@ -1075,6 +1021,7 @@ router.post('/:id/return', async (req, res) => {
     const refundType = String(req.body?.refund_type || 'cash').toLowerCase() === 'credit' ? 'credit' : 'cash';
 
     await client.query('BEGIN');
+    await lockShopDocumentNumbers(client, req.shopId);
 
     const origRes = await client.query(
       `SELECT * FROM sales WHERE sale_id = $1 AND shop_id = $2`,

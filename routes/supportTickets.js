@@ -3,6 +3,10 @@ const router = express.Router();
 const db = require('../db');
 const { requireAuth, isElevatedRole } = require('../middleware/authMiddleware');
 const { requireShopContext } = require('../middleware/shopContextMiddleware');
+const {
+  lockShopDocumentNumbers,
+  generateSupportTicketNumber,
+} = require('../lib/documentNumbers');
 
 router.use(requireAuth);
 router.use(requireShopContext);
@@ -83,21 +87,6 @@ function parseImages(images) {
     });
   }
   return out;
-}
-
-async function nextTicketNumber(client, shopId) {
-  const r = await client.query(
-    `SELECT ticket_number FROM support_tickets
-     WHERE shop_id = $1 AND ticket_number ~ '^ST-[0-9]+$'
-     ORDER BY ticket_id DESC LIMIT 1`,
-    [shopId]
-  );
-  let n = 0;
-  if (r.rows[0]?.ticket_number) {
-    const m = String(r.rows[0].ticket_number).match(/^ST-(\d+)$/i);
-    if (m) n = parseInt(m[1], 10);
-  }
-  return `ST-${String(n + 1).padStart(5, '0')}`;
 }
 
 function mapListRow(row) {
@@ -265,7 +254,8 @@ router.post('/', async (req, res) => {
     const createdByRole = String(req.user?.role || 'staff').trim();
 
     await client.query('BEGIN');
-    const ticketNumber = await nextTicketNumber(client, req.shopId);
+    await lockShopDocumentNumbers(client, req.shopId);
+    const ticketNumber = await generateSupportTicketNumber(req.shopId, client);
     const ins = await client.query(
       `INSERT INTO support_tickets (
          shop_id, ticket_number, created_by_user_id, created_by_name, created_by_role,
