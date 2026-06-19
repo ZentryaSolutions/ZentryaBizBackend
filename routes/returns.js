@@ -68,7 +68,19 @@ router.get('/', async (req, res) => {
         s.customer_id,
         COALESCE(c.name, sr.customer_name, s.customer_name) AS customer_name,
         orig.invoice_number AS original_invoice_number,
-        (SELECT COUNT(*)::int FROM sale_items si WHERE si.sale_id = s.sale_id) AS item_count,
+        COALESCE(
+          (
+            SELECT COALESCE(SUM(sri.quantity), 0)::int
+            FROM sales_returns sr_cnt
+            JOIN sales_return_items sri ON sri.return_id = sr_cnt.return_id
+            WHERE sr_cnt.sale_id = s.sale_id AND sr_cnt.shop_id = s.shop_id
+          ),
+          (
+            SELECT COALESCE(SUM(si.quantity), 0)::int
+            FROM sale_items si
+            WHERE si.sale_id = s.sale_id
+          )
+        ) AS item_count,
         (
           SELECT string_agg(sub.nm, ', ')
           FROM (
