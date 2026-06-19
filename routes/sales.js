@@ -34,6 +34,22 @@ function withPaymentMode(sale) {
   return { ...sale, payment_mode: sale.payment_mode || 'cash' };
 }
 
+function catalogPriceForProduct(product, priceType) {
+  const retail = parseFloat(product.retail_price ?? product.selling_price) || 0;
+  const p = String(priceType || 'retail').toLowerCase();
+  if (p === 'wholesale') {
+    return parseFloat(product.wholesale_price) || retail;
+  }
+  if (p === 'special') {
+    return parseFloat(product.special_price) || retail;
+  }
+  return retail;
+}
+
+function pricesDiffer(a, b) {
+  return Math.abs((parseFloat(a) || 0) - (parseFloat(b) || 0)) > 0.009;
+}
+
 // Generate next invoice number (per shop) in Bill-0000X format
 async function generateInvoiceNumber(shopId) {
   try {
@@ -254,11 +270,12 @@ router.post('/', async (req, res) => {
     let totalProfit = 0;
 
     const normalizedItems = [];
+    const priceOverrides = [];
 
     for (const item of items) {
-      const { product_id, quantity, selling_price } = item;
+      const { product_id, quantity, selling_price, price_type } = item;
 
-      if (!product_id || !quantity || !selling_price) {
+      if (!product_id || !quantity || selling_price === '' || selling_price == null) {
         throw new Error('Invalid item: product_id, quantity, and selling_price are required');
       }
 
@@ -266,12 +283,14 @@ router.post('/', async (req, res) => {
         throw new Error('Quantity must be greater than 0');
       }
 
-      if (selling_price <= 0) {
+      if (parseFloat(selling_price) <= 0) {
         throw new Error('Selling price must be greater than 0');
       }
 
       const productResult = await client.query(
-        'SELECT quantity_in_stock, purchase_price FROM products WHERE product_id = $1 AND shop_id = $2',
+        `SELECT quantity_in_stock, purchase_price, retail_price, wholesale_price, special_price, selling_price,
+                item_name_english, name
+           FROM products WHERE product_id = $1 AND shop_id = $2`,
         [product_id, req.shopId]
       );
 
@@ -283,6 +302,18 @@ router.post('/', async (req, res) => {
       const pid = parseInt(product_id, 10);
       const q = parseFloat(quantity);
       qtyByProduct.set(pid, (qtyByProduct.get(pid) || 0) + q);
+
+      const soldPrice = parseFloat(selling_price);
+      const catalogPrice = catalogPriceForProduct(product, price_type);
+      if (pricesDiffer(soldPrice, catalogPrice)) {
+        priceOverrides.push({
+          product_id: pid,
+          product_name: product.item_name_english || product.name || `Product #${pid}`,
+          price_type: String(price_type || 'retail').toLowerCase(),
+          catalog_price: catalogPrice,
+          sold_price: soldPrice,
+        });
+      }
 
       const purchasePrice = parseFloat(product.purchase_price) || 0;
       const gross = lineGross(q, selling_price);
@@ -462,9 +493,29 @@ router.post('/', async (req, res) => {
         items: normalizedItems.map((it) =>
           pickFields(it, ['product_id', 'quantity', 'selling_price', 'line_discount'])
         ),
+        ...(priceOverrides.length ? { price_overrides: priceOverrides } : {}),
       },
       notes: `Created invoice ${invoiceNumber}`,
     });
+
+    if (priceOverrides.length) {
+      const overrideSummary = priceOverrides
+        .map(
+          (o) =>
+            `${o.product_name}: PKR ${Number(o.catalog_price).toFixed(2)} → PKR ${Number(o.sold_price).toFixed(2)} (${o.price_type})`
+        )
+        .join('; ');
+      await auditFromReq(req, {
+        action: 'update',
+        tableName: 'sales',
+        recordId: saleId,
+        newValues: {
+          invoice_number: invoiceNumber,
+          price_overrides: priceOverrides,
+        },
+        notes: `Billing price override on ${invoiceNumber}: ${overrideSummary}`,
+      });
+    }
 
     // Fetch complete sale with items for response
     const [saleResultFinal, itemsResult] = await Promise.all([
