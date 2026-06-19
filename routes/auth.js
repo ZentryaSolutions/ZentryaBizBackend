@@ -36,7 +36,7 @@ const { isDeviceTrusted, addTrustedDevice } = require('../utils/trustedDevices')
 const { consumeLogoutAllToken } = require('../utils/emailSecurityTokens');
 const { sendLoginAlertEmail, getFrontendBaseUrl } = require('../utils/loginAlertEmail');
 const { verifyGoogleIdToken, getGoogleClientId } = require('../utils/googleIdToken');
-const { applySignupAccountProfile, normalizeSignupAccountType } = require('../lib/accountRoles');
+const { applySignupAccountProfile, normalizeSignupAccountType, getSignupKindState } = require('../lib/accountRoles');
 const {
   refreshPlanLifecycleForProfile,
   maybeSendPlanRenewalReminder,
@@ -184,7 +184,7 @@ async function finalizeZbSimpleAuthSession(req, { user, zb, deviceId, ipAddress,
   return sessionId;
 }
 
-function buildZbAuthPayload(zb, planStatus = null) {
+function buildZbAuthPayload(zb, planStatus = null, signupState = null) {
   const email =
     normalizeEmail(zb.email) ||
     String(zb.username || '')
@@ -198,7 +198,15 @@ function buildZbAuthPayload(zb, planStatus = null) {
     plan: planStatus?.plan || null,
     trial_ends_at: planStatus?.trial_ends_at || null,
     stripe_current_period_end: planStatus?.stripe_current_period_end || null,
+    needsSignupRole: Boolean(signupState?.needsSignupRole),
+    signup_kind: signupState?.signup_kind || null,
+    profile_role: signupState?.profile_role || null,
   };
+}
+
+async function authPayloadWithSignupState(zb, planStatus = null) {
+  const signupState = await getSignupKindState(db, zb.id);
+  return buildZbAuthPayload(zb, planStatus, signupState);
 }
 
 /**
@@ -514,21 +522,19 @@ async function resolveOrCreateZbGoogleUser({ email, googleSub, fullName, account
       zbRow = ins.rows[0];
     }
 
-    const signupKind = normalizeSignupAccountType(accountType);
     await insertProfileWithFallbacks(client, {
       zbId: zbRow.id,
       displayName: name,
-      userRole: signupKind === 'cashier' ? 'cashier' : 'administrator',
-      planRaw: signupKind === 'cashier' ? 'starter' : 'trial',
+      userRole: 'administrator',
+      planRaw: 'trial',
     });
-    await applySignupAccountProfile(client, zbRow.id, signupKind, { updateUsersRow: false });
 
     const passwordHash = await hashPassword(randomSecret);
     const userIns = await client.query(
       `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
-       VALUES ($1, $2, $3, $4, true, $5::uuid)
+       VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
        RETURNING user_id, username, name, role`,
-      [name, em, passwordHash, signupKind === 'cashier' ? 'cashier' : 'administrator', zbRow.id]
+      [name, em, passwordHash, zbRow.id]
     );
 
     await client.query('COMMIT');
@@ -1304,6 +1310,8 @@ router.post('/google', async (req, res) => {
       return res.status(flow.status).json(flow.body);
     }
 
+    const authPayload = await authPayloadWithSignupState(zb, flow.planStatus);
+
     if (flow.requiresOtp) {
       return res.json({
         success: true,
@@ -1312,7 +1320,7 @@ router.post('/google', async (req, res) => {
         emailHint: flow.emailHint,
         authMethod: 'google',
         isNewAccount: Boolean(isNew),
-        ...buildZbAuthPayload(zb, flow.planStatus),
+        ...authPayload,
       });
     }
 
@@ -1322,7 +1330,7 @@ router.post('/google', async (req, res) => {
       user: flow.user,
       authMethod: 'google',
       isNewAccount: Boolean(isNew),
-      ...buildZbAuthPayload(zb, flow.planStatus),
+      ...authPayload,
     });
   } catch (error) {
     console.error('[Auth Route] google sign-in error:', error);
@@ -1396,6 +1404,8 @@ router.post('/google/verify-otp', async (req, res) => {
       userAgent,
     });
 
+    const authPayload = await authPayloadWithSignupState(zb, null);
+
     res.json({
       success: true,
       sessionId,
@@ -1405,10 +1415,7 @@ router.post('/google/verify-otp', async (req, res) => {
         name: user.name,
         role: user.role,
       },
-      user_id: zb.id,
-      username: zb.username,
-      full_name: zb.full_name,
-      email: em,
+      ...authPayload,
     });
   } catch (error) {
     console.error('[Auth Route] google/verify-otp error:', error);
@@ -1694,6 +1701,43 @@ router.put('/zb-email-mfa', requireAuth, async (req, res) => {
  * POST /api/auth/logout
  * Logout and destroy session
  */
+router.post('/complete-signup-role', requireAuth, async (req, res) => {
+  try {
+    const uidResult = await db.query(
+      `SELECT zb_profile_id FROM users WHERE user_id = $1 AND is_active = true`,
+      [req.user.user_id]
+    );
+    const profileId = uidResult.rows[0]?.zb_profile_id;
+    if (!profileId) {
+      return res.status(404).json({ error: 'Profile not linked' });
+    }
+
+    const state = await getSignupKindState(db, profileId);
+    if (!state.needsSignupRole) {
+      return res.json({
+        ok: true,
+        already_set: true,
+        account_type: state.signup_kind,
+        profile_role: state.profile_role,
+      });
+    }
+
+    const accountType = normalizeSignupAccountType(req.body?.accountType);
+    await applySignupAccountProfile(db, profileId, accountType, { updateUsersRow: true });
+
+    const next = await getSignupKindState(db, profileId);
+    return res.json({
+      ok: true,
+      account_type: accountType,
+      signup_kind: next.signup_kind,
+      profile_role: next.profile_role,
+    });
+  } catch (error) {
+    console.error('[Auth Route] complete-signup-role:', error);
+    return res.status(500).json({ error: 'Failed to save account type' });
+  }
+});
+
 router.post('/logout', requireAuth, async (req, res) => {
   try {
     const sessionId = req.sessionId;
