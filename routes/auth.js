@@ -278,6 +278,30 @@ async function resolveZbSimpleLogin(username, password) {
   }
 
   if (zbResult.rows.length === 0) {
+    let googleOnly = { rows: [] };
+    try {
+      googleOnly = await db.query(
+        `SELECT google_sub FROM zb_simple_users
+         WHERE (lower(trim(username)) = $1 OR lower(trim(coalesce(email, ''))) = $1)
+           AND google_sub IS NOT NULL AND trim(google_sub) <> ''
+         LIMIT 1`,
+        [u]
+      );
+    } catch (e) {
+      if (e.code !== '42703') throw e;
+    }
+    if (googleOnly.rows.length) {
+      return {
+        ok: false,
+        status: 401,
+        body: {
+          error: 'Google sign-in required',
+          message:
+            'This account was created with Google. Use Continue with Google — your Gmail password is not used here.',
+          authMethod: 'google',
+        },
+      };
+    }
     return {
       ok: false,
       status: 401,
