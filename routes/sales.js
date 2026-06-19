@@ -50,35 +50,40 @@ function pricesDiffer(a, b) {
   return Math.abs((parseFloat(a) || 0) - (parseFloat(b) || 0)) > 0.009;
 }
 
-// Generate next invoice number (per shop) in Bill-0000X format
+// Generate next invoice number (per shop) in INV-YYYY-NNNN format
 async function generateInvoiceNumber(shopId) {
   try {
+    const year = new Date().getFullYear();
+    const prefix = `INV-${year}-`;
+
     const result = await db.query(
-      `SELECT invoice_number FROM sales 
+      `SELECT invoice_number FROM sales
        WHERE shop_id = $1
-       ORDER BY sale_id DESC LIMIT 1`,
+       ORDER BY sale_id DESC
+       LIMIT 1`,
       [shopId]
     );
 
-    if (result.rows.length === 0) {
-      return 'Bill-00001';
+    let nextSeq = 1;
+    if (result.rows.length > 0) {
+      const lastInvoice = String(result.rows[0].invoice_number || '').trim();
+      const invMatch = lastInvoice.match(/INV-(\d{4})-(\d+)/i);
+      const billMatch = lastInvoice.match(/Bill-(\d+)/i);
+      if (invMatch) {
+        const lastYear = parseInt(invMatch[1], 10);
+        const lastNum = parseInt(invMatch[2], 10);
+        nextSeq = lastYear === year && Number.isFinite(lastNum) ? lastNum + 1 : 1;
+      } else if (billMatch) {
+        const lastNum = parseInt(billMatch[1], 10);
+        nextSeq = Number.isFinite(lastNum) ? lastNum + 1 : 1;
+      }
     }
 
-    const lastInvoice = String(result.rows[0].invoice_number || '').trim();
-    // Accept legacy INV-xxxx and newer Bill-xxxxx, continue numeric sequence safely.
-    const match = lastInvoice.match(/(?:INV|Bill)-(\d+)/i);
-    
-    if (match) {
-      const lastNumber = parseInt(match[1]);
-      const nextNumber = lastNumber + 1;
-      return `Bill-${String(nextNumber).padStart(5, '0')}`;
-    }
-
-    // Fallback if format doesn't match
-    return 'Bill-00001';
+    return `${prefix}${String(nextSeq).padStart(4, '0')}`;
   } catch (error) {
     console.error('Error generating invoice number:', error);
-    return 'Bill-00001';
+    const year = new Date().getFullYear();
+    return `INV-${year}-0001`;
   }
 }
 
@@ -152,6 +157,17 @@ router.get('/', async (req, res) => {
   } catch (error) {
     console.error('Error fetching sales:', error);
     res.status(500).json({ error: 'Failed to fetch sales', message: error.message });
+  }
+});
+
+// Next draft invoice number for billing (assigned on save; preview only)
+router.get('/next-invoice-number', async (req, res) => {
+  try {
+    const invoice_number = await generateInvoiceNumber(req.shopId);
+    return res.json({ ok: true, invoice_number });
+  } catch (error) {
+    console.error('Error fetching next invoice number:', error);
+    return res.status(500).json({ error: 'Failed to fetch next invoice number' });
   }
 });
 
