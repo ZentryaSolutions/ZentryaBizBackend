@@ -51,39 +51,44 @@ function pricesDiffer(a, b) {
 }
 
 // Generate next invoice number (per shop) in INV-YYYY-NNNN format
-async function generateInvoiceNumber(shopId) {
+async function generateInvoiceNumber(shopId, client) {
+  const q = client || db;
+  const year = new Date().getFullYear();
+  const prefix = `INV-${year}-`;
+
   try {
-    const year = new Date().getFullYear();
-    const prefix = `INV-${year}-`;
-
-    const result = await db.query(
-      `SELECT invoice_number FROM sales
+    const invResult = await q.query(
+      `SELECT COALESCE(MAX(
+         (regexp_match(invoice_number, 'INV-' || $2::text || '-(\\d+)', 'i'))[1]::int
+       ), 0) AS max_seq
+       FROM sales
        WHERE shop_id = $1
-       ORDER BY sale_id DESC
-       LIMIT 1`,
-      [shopId]
+         AND invoice_number ~* ('^INV-' || $2::text || '-\\d+$')
+         AND lower(COALESCE(sale_kind, '')) <> 'return'
+         AND invoice_number NOT ILIKE 'CN-%'`,
+      [shopId, year]
     );
+    let nextSeq = (parseInt(invResult.rows[0]?.max_seq, 10) || 0) + 1;
 
-    let nextSeq = 1;
-    if (result.rows.length > 0) {
-      const lastInvoice = String(result.rows[0].invoice_number || '').trim();
-      const invMatch = lastInvoice.match(/INV-(\d{4})-(\d+)/i);
-      const billMatch = lastInvoice.match(/Bill-(\d+)/i);
-      if (invMatch) {
-        const lastYear = parseInt(invMatch[1], 10);
-        const lastNum = parseInt(invMatch[2], 10);
-        nextSeq = lastYear === year && Number.isFinite(lastNum) ? lastNum + 1 : 1;
-      } else if (billMatch) {
-        const lastNum = parseInt(billMatch[1], 10);
-        nextSeq = Number.isFinite(lastNum) ? lastNum + 1 : 1;
-      }
+    if (nextSeq <= 1) {
+      const billResult = await q.query(
+        `SELECT COALESCE(MAX(
+           (regexp_match(invoice_number, 'Bill-(\\d+)', 'i'))[1]::int
+         ), 0) AS max_seq
+         FROM sales
+         WHERE shop_id = $1
+           AND invoice_number ~* '^Bill-\\d+$'
+           AND lower(COALESCE(sale_kind, '')) <> 'return'`,
+        [shopId]
+      );
+      const billMax = parseInt(billResult.rows[0]?.max_seq, 10) || 0;
+      if (billMax > 0) nextSeq = billMax + 1;
     }
 
     return `${prefix}${String(nextSeq).padStart(4, '0')}`;
   } catch (error) {
     console.error('Error generating invoice number:', error);
-    const year = new Date().getFullYear();
-    return `INV-${year}-0001`;
+    return `${prefix}0001`;
   }
 }
 
@@ -278,7 +283,7 @@ router.post('/', async (req, res) => {
     }
 
     // Generate invoice number
-    const invoiceNumber = await generateInvoiceNumber(req.shopId);
+    const invoiceNumber = await generateInvoiceNumber(req.shopId, client);
 
     // Validate each line + aggregate quantities per product (same product on multiple lines)
     const qtyByProduct = new Map();
