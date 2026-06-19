@@ -125,7 +125,7 @@ function mapMessageRow(row) {
   };
 }
 
-/** Load ticket in this shop; enforce cashier vs admin visibility */
+/** Load ticket in this shop (any staff member with shop access) */
 async function loadTicketForRequest(req, ticketId) {
   const hdr = await db.query(
     `SELECT t.*
@@ -138,35 +138,20 @@ async function loadTicketForRequest(req, ticketId) {
     err.status = 404;
     throw err;
   }
-  const row = hdr.rows[0];
-  const adminView = await isShopAdminForRequest(req);
-  if (!adminView && Number(row.created_by_user_id) !== Number(req.user.user_id)) {
-    const err = new Error('Access denied');
-    err.status = 403;
-    throw err;
-  }
-  return row;
+  return hdr.rows[0];
 }
 
-/** List tickets — shop admin: all in shop; cashier: own only */
+/** List tickets — all staff in the active shop see every ticket for that shop */
 router.get('/', async (req, res) => {
   try {
-    const adminView = await isShopAdminForRequest(req);
-    const params = [req.shopId];
-    let where = 't.shop_id = $1';
-    if (!adminView) {
-      params.push(req.user.user_id);
-      where += ` AND t.created_by_user_id = $${params.length}`;
-    }
-
     const result = await db.query(
       `SELECT t.*,
               (SELECT COUNT(*)::int FROM support_ticket_images i WHERE i.ticket_id = t.ticket_id) AS image_count,
               (SELECT COUNT(*)::int FROM support_ticket_messages m WHERE m.ticket_id = t.ticket_id) AS message_count
        FROM support_tickets t
-       WHERE ${where}
+       WHERE t.shop_id = $1
        ORDER BY t.created_at DESC, t.ticket_id DESC`,
-      params
+      [req.shopId]
     );
 
     res.json(result.rows.map(mapListRow));
@@ -415,6 +400,11 @@ async function updateTicketStatusHandler(req, res) {
     }
 
     await loadTicketForRequest(req, ticketId);
+
+    const adminView = await isShopAdminForRequest(req);
+    if (!adminView) {
+      return res.status(403).json({ error: 'Only shop administrators can change ticket status.' });
+    }
 
     const resolverName = String(req.user?.name || req.user?.username || 'User').trim();
     const resolverRole = String(req.user?.role || 'staff').trim();
