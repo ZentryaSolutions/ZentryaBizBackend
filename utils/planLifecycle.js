@@ -1,5 +1,6 @@
 const db = require('../db');
 const { shopLimitForPlan } = require('../lib/planShopLimits');
+const { isStaffProfileRole } = require('../lib/accountRoles');
 const { sendTransactionalEmail } = require('./transactionalMail');
 const { getAppBaseUrl } = require('./appBaseUrl');
 const { DEFAULT_TZ } = require('./businessDate');
@@ -175,6 +176,22 @@ async function ensurePlanLifecycleColumns() {
 async function expireTrialIfNeeded(profileId) {
   if (!profileId || !db.isDatabaseConfigured()) return null;
   await ensurePlanLifecycleColumns();
+
+  const roleRow = await db.query(`SELECT role::text AS role FROM public.profiles WHERE id = $1::uuid LIMIT 1`, [
+    profileId,
+  ]);
+  if (isStaffProfileRole(roleRow.rows[0]?.role)) {
+    const current = await db.query(
+      `SELECT id::text, plan::text AS plan, shop_limit, trial_started_at, trial_ends_at,
+              stripe_current_period_end, plan_reminder_period_end
+         FROM public.profiles
+        WHERE id = $1::uuid
+        LIMIT 1`,
+      [profileId]
+    );
+    return current.rows[0] || null;
+  }
+
   await reconcileProfileShopLimit(profileId);
 
   const runExpire = () =>

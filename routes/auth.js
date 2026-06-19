@@ -36,6 +36,7 @@ const { isDeviceTrusted, addTrustedDevice } = require('../utils/trustedDevices')
 const { consumeLogoutAllToken } = require('../utils/emailSecurityTokens');
 const { sendLoginAlertEmail, getFrontendBaseUrl } = require('../utils/loginAlertEmail');
 const { verifyGoogleIdToken, getGoogleClientId } = require('../utils/googleIdToken');
+const { applySignupAccountProfile, normalizeSignupAccountType } = require('../lib/accountRoles');
 const {
   refreshPlanLifecycleForProfile,
   maybeSendPlanRenewalReminder,
@@ -391,7 +392,7 @@ async function resolveZbByEmail(email) {
 /**
  * Find or create zb_simple_users + users for Google Sign-In.
  */
-async function resolveOrCreateZbGoogleUser({ email, googleSub, fullName }) {
+async function resolveOrCreateZbGoogleUser({ email, googleSub, fullName, accountType }) {
   const em = normalizeEmail(email);
   const sub = String(googleSub || '').trim();
   const name = String(fullName || '').trim() || em.split('@')[0];
@@ -513,19 +514,21 @@ async function resolveOrCreateZbGoogleUser({ email, googleSub, fullName }) {
       zbRow = ins.rows[0];
     }
 
+    const signupKind = normalizeSignupAccountType(accountType);
     await insertProfileWithFallbacks(client, {
       zbId: zbRow.id,
       displayName: name,
-      userRole: 'administrator',
-      planRaw: 'trial',
+      userRole: signupKind === 'cashier' ? 'cashier' : 'administrator',
+      planRaw: signupKind === 'cashier' ? 'starter' : 'trial',
     });
+    await applySignupAccountProfile(client, zbRow.id, signupKind, { updateUsersRow: false });
 
     const passwordHash = await hashPassword(randomSecret);
     const userIns = await client.query(
       `INSERT INTO users (name, username, password_hash, role, is_active, zb_profile_id)
-       VALUES ($1, $2, $3, 'administrator', true, $4::uuid)
+       VALUES ($1, $2, $3, $4, true, $5::uuid)
        RETURNING user_id, username, name, role`,
-      [name, em, passwordHash, zbRow.id]
+      [name, em, passwordHash, signupKind === 'cashier' ? 'cashier' : 'administrator', zbRow.id]
     );
 
     await client.query('COMMIT');
@@ -935,7 +938,7 @@ router.post('/staff-invite/:token/accept-existing', async (req, res) => {
  */
 router.post('/zb-signup-with-otp', async (req, res) => {
   try {
-    const { fullName, email, password, otp } = req.body || {};
+    const { fullName, email, password, otp, accountType } = req.body || {};
     const em = String(email || '').trim().toLowerCase();
     const fn = String(fullName || '').trim();
     const pw = String(password || '');
@@ -991,11 +994,18 @@ router.post('/zb-signup-with-otp', async (req, res) => {
 
     await markEmailOtpConsumed(otpCheck.rowId);
 
+    try {
+      await applySignupAccountProfile(db, data.user_id, accountType);
+    } catch (profileErr) {
+      console.warn('[Auth] zb-signup account profile:', profileErr.message);
+    }
+
     return res.json({
       ok: true,
       user_id: data.user_id,
       username: data.username,
       full_name: data.full_name,
+      account_type: normalizeSignupAccountType(accountType),
     });
   } catch (error) {
     console.error('[Auth Route] zb-signup-with-otp error:', error);
@@ -1276,11 +1286,13 @@ router.post('/google', async (req, res) => {
     }
 
     const credential = req.body?.credential || req.body?.id_token;
+    const accountType = req.body?.accountType;
     const googleUser = await verifyGoogleIdToken(credential);
     const resolved = await resolveOrCreateZbGoogleUser({
       email: googleUser.email,
       googleSub: googleUser.sub,
       fullName: googleUser.name,
+      accountType,
     });
     if (!resolved.ok) {
       return res.status(resolved.status).json(resolved.body);
