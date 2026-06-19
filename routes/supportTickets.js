@@ -21,6 +21,12 @@ function normalizeRoleKey(role) {
     .toLowerCase();
 }
 
+/** POS `users.user_id` is integer — session may store it as string. */
+function posUserId(req) {
+  const id = Number.parseInt(String(req.user?.user_id ?? ''), 10);
+  return Number.isFinite(id) ? id : null;
+}
+
 async function isShopAdminForRequest(req) {
   if (isElevatedRole(req.user?.role)) return true;
 
@@ -237,6 +243,10 @@ router.post('/', async (req, res) => {
 
     const createdByName = String(req.user?.name || req.user?.username || 'User').trim();
     const createdByRole = String(req.user?.role || 'staff').trim();
+    const creatorUserId = posUserId(req);
+    if (creatorUserId == null) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
 
     await client.query('BEGIN');
     await lockShopDocumentNumbers(client, req.shopId);
@@ -250,7 +260,7 @@ router.post('/', async (req, res) => {
       [
         req.shopId,
         ticketNumber,
-        req.user.user_id,
+        creatorUserId,
         createdByName,
         createdByRole,
         heading,
@@ -353,13 +363,17 @@ router.post('/:id/messages', async (req, res) => {
 
     const senderName = String(req.user?.name || req.user?.username || 'User').trim();
     const senderRole = String(req.user?.role || 'staff').trim();
+    const senderUserId = posUserId(req);
+    if (senderUserId == null) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
 
     const ins = await db.query(
       `INSERT INTO support_ticket_messages (
          ticket_id, shop_id, sender_user_id, sender_name, sender_role, sender_kind, body
        ) VALUES ($1, $2, $3, $4, $5, 'shop_staff', $6)
        RETURNING message_id, ticket_id, sender_user_id, sender_name, sender_role, sender_kind, body, created_at`,
-      [ticketId, req.shopId, req.user.user_id, senderName, senderRole, body]
+      [ticketId, req.shopId, senderUserId, senderName, senderRole, body]
     );
 
     res.status(201).json(
@@ -408,6 +422,10 @@ async function updateTicketStatusHandler(req, res) {
 
     const resolverName = String(req.user?.name || req.user?.username || 'User').trim();
     const resolverRole = String(req.user?.role || 'staff').trim();
+    const resolverUserId = posUserId(req);
+    if (resolverUserId == null) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
 
     let result;
     try {
@@ -415,13 +433,13 @@ async function updateTicketStatusHandler(req, res) {
         `UPDATE support_tickets
             SET status = $1,
                 resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE NULL END,
-                resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END,
+                resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2::integer ELSE NULL END,
                 resolved_by_name = CASE WHEN $1 = 'resolved' THEN $3 ELSE NULL END,
                 resolved_by_role = CASE WHEN $1 = 'resolved' THEN $4 ELSE NULL END,
                 updated_at = now()
           WHERE ticket_id = $5 AND shop_id = $6::uuid
           RETURNING *`,
-        [status, req.user.user_id, resolverName, resolverRole, ticketId, req.shopId]
+        [status, resolverUserId, resolverName, resolverRole, ticketId, req.shopId]
       );
     } catch (colErr) {
       if (colErr.code === '42703') {
@@ -429,11 +447,11 @@ async function updateTicketStatusHandler(req, res) {
           `UPDATE support_tickets
               SET status = $1,
                   resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE NULL END,
-                  resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END,
+                  resolved_by_user_id = CASE WHEN $1 = 'resolved' THEN $2::integer ELSE NULL END,
                   updated_at = now()
             WHERE ticket_id = $3 AND shop_id = $4::uuid
             RETURNING *`,
-          [status, req.user.user_id, ticketId, req.shopId]
+          [status, resolverUserId, ticketId, req.shopId]
         );
       } else {
         throw colErr;
