@@ -500,8 +500,12 @@ router.delete('/:id', async (req, res) => {
     const paymentsCount = parseInt(paymentsCheck.rows[0].count);
 
     if (salesCount > 0 || paymentsCount > 0) {
-      return res.status(400).json({ 
-        error: `Cannot delete customer: has ${salesCount} sale(s) and ${paymentsCount} payment(s)` 
+      return res.status(400).json({
+        error: `Cannot delete customer: has ${salesCount} sale(s) and ${paymentsCount} payment(s)`,
+        message:
+          'This customer has sales or payment history and cannot be deleted. Edit the customer and set status to Inactive to hide them from new billing.',
+        salesCount,
+        paymentsCount,
       });
     }
 
