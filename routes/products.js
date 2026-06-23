@@ -628,19 +628,32 @@ router.post('/import-bulk', async (req, res) => {
       const sku = r.sku != null ? String(r.sku).trim() : '';
       const category = String(r.category || r.Category || 'General').trim() || 'General';
       const unit = String(r.unit || r.Unit || 'piece').trim() || 'piece';
+      const purchase = parseFloat(r.purchase_price ?? r['Purchase Price'] ?? r.purchase);
       const selling = parseFloat(r.selling_price ?? r['Selling Price'] ?? r.selling);
       const wholesale = parseFloat(r.wholesale_price ?? r['Wholesale Price'] ?? selling);
       const stock = parseFloat(r.opening_stock ?? r['Opening Stock'] ?? 0);
 
       const errors = [];
       if (!name) errors.push('Name is required');
-      if (!Number.isFinite(selling) || selling < 0) errors.push('Invalid selling price');
+      if (!Number.isFinite(purchase) || purchase <= 0) errors.push('Invalid purchase price');
+      if (!Number.isFinite(selling) || selling <= 0) errors.push('Invalid selling price');
       if (!Number.isFinite(wholesale) || wholesale < 0) errors.push('Invalid wholesale price');
       if (!Number.isFinite(stock) || stock < 0) errors.push('Invalid opening stock');
 
-      preview.push({ row: i + 1, name, sku, category, unit, selling_price: selling, wholesale_price: wholesale, opening_stock: stock, errors });
+      preview.push({
+        row: i + 1,
+        name,
+        sku,
+        category,
+        unit,
+        purchase_price: purchase,
+        selling_price: selling,
+        wholesale_price: wholesale,
+        opening_stock: stock,
+        errors,
+      });
       if (!errors.length) {
-        toInsert.push({ name, sku, category, unit, selling, wholesale, stock });
+        toInsert.push({ name, sku, category, unit, purchase, selling, wholesale, stock });
       }
     }
 
@@ -681,7 +694,8 @@ router.post('/import-bulk', async (req, res) => {
           row.sku || null,
           row.category,
           finalCategoryId,
-          row.wholesale,
+          row.purchase,
+          row.selling,
           row.selling,
           row.wholesale,
           row.unit,
