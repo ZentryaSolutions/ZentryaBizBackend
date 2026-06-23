@@ -11,6 +11,15 @@ const {
   buildProductDeleteNotes,
 } = require('../lib/auditTrail');
 
+const DEFAULT_LOW_STOCK_THRESHOLD = 10;
+
+function parseLowStockThreshold(value, fallback = DEFAULT_LOW_STOCK_THRESHOLD) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
 // All product routes require authentication (both admins and cashiers can view products)
 router.use(requireAuth);
 router.use(requireShopContext);
@@ -61,6 +70,7 @@ router.get('/', async (req, res) => {
         p.is_frequently_sold,
         p.display_order,
         p.quantity_in_stock,
+        p.low_stock_threshold,
         p.supplier_id,
         s.name as supplier_name,
         c.category_name,
@@ -284,6 +294,7 @@ router.get('/:id', async (req, res) => {
         p.is_frequently_sold,
         p.display_order,
         p.quantity_in_stock,
+        p.low_stock_threshold,
         p.supplier_id,
         s.name as supplier_name,
         c.category_name,
@@ -314,7 +325,7 @@ router.post('/', async (req, res) => {
     const { 
       name, item_name_english, item_name_urdu, sku, category, category_id, sub_category_id,
       purchase_price, selling_price, retail_price, wholesale_price, special_price,
-      unit_type, is_frequently_sold, display_order, quantity_in_stock, supplier_id 
+      unit_type, is_frequently_sold, display_order, quantity_in_stock, low_stock_threshold, supplier_id 
     } = req.body;
 
     // Use item_name_english or name (backward compatibility)
@@ -361,20 +372,22 @@ router.post('/', async (req, res) => {
       }
     }
 
+    const finalLowStockThreshold = parseLowStockThreshold(low_stock_threshold);
+
     const result = await db.query(
       `INSERT INTO products (
         name, item_name_english, item_name_urdu, sku, category, category_id, sub_category_id,
         purchase_price, selling_price, retail_price, wholesale_price, special_price,
-        unit_type, is_frequently_sold, display_order, quantity_in_stock, supplier_id, shop_id
+        unit_type, is_frequently_sold, display_order, quantity_in_stock, low_stock_threshold, supplier_id, shop_id
       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        RETURNING *`,
       [
         englishName.trim(), englishName.trim(), item_name_urdu || null, sku || null, 
         category || null, finalCategoryId, sub_category_id || null,
         purchase_price, finalRetailPrice, finalRetailPrice, finalWholesalePrice, special_price || null,
         unit_type || 'piece', is_frequently_sold || false, display_order || 0, 
-        quantity_in_stock || 0, supplier_id || null, shopId
+        quantity_in_stock || 0, finalLowStockThreshold, supplier_id || null, shopId
       ]
     );
 
@@ -398,6 +411,7 @@ router.post('/', async (req, res) => {
         p.is_frequently_sold,
         p.display_order,
         p.quantity_in_stock,
+        p.low_stock_threshold,
         p.supplier_id,
         s.name as supplier_name,
         c.category_name,
@@ -438,7 +452,7 @@ router.put('/:id', async (req, res) => {
     const { 
       name, item_name_english, item_name_urdu, sku, category, category_id, sub_category_id,
       purchase_price, selling_price, retail_price, wholesale_price, special_price,
-      unit_type, is_frequently_sold, display_order, quantity_in_stock, supplier_id 
+      unit_type, is_frequently_sold, display_order, quantity_in_stock, low_stock_threshold, supplier_id 
     } = req.body;
 
     // Use item_name_english or name (backward compatibility)
@@ -494,14 +508,19 @@ router.put('/:id', async (req, res) => {
       }
     }
 
+    const finalLowStockThreshold =
+      low_stock_threshold !== undefined && low_stock_threshold !== null
+        ? parseLowStockThreshold(low_stock_threshold, parseLowStockThreshold(existing.low_stock_threshold))
+        : parseLowStockThreshold(existing.low_stock_threshold);
+
     const result = await db.query(
       `UPDATE products 
        SET name = $1, item_name_english = $2, item_name_urdu = $3, sku = $4, category = $5,
            category_id = $6, sub_category_id = $7, purchase_price = $8, 
            selling_price = $9, retail_price = $10, wholesale_price = $11, special_price = $12,
            unit_type = $13, is_frequently_sold = $14, display_order = $15,
-           quantity_in_stock = $16, supplier_id = $17
-       WHERE product_id = $18 AND shop_id = $19
+           quantity_in_stock = $16, low_stock_threshold = $17, supplier_id = $18
+       WHERE product_id = $19 AND shop_id = $20
        RETURNING *`,
       [
         englishName.trim(), englishName.trim(), item_name_urdu || null, sku || null,
@@ -510,7 +529,7 @@ router.put('/:id', async (req, res) => {
         unit_type || existing.unit_type || 'piece', 
         is_frequently_sold !== undefined ? is_frequently_sold : existing.is_frequently_sold,
         display_order !== undefined ? display_order : existing.display_order,
-        quantity_in_stock || 0, supplier_id || null, id, shopId
+        quantity_in_stock || 0, finalLowStockThreshold, supplier_id || null, id, shopId
       ]
     );
 

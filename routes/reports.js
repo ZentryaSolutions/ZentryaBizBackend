@@ -590,7 +590,7 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
     const lowStockCountQuery = `
       SELECT COUNT(*)::int AS c
       FROM products
-      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      WHERE quantity_in_stock <= COALESCE(low_stock_threshold, 10) AND shop_id = $1
     `;
 
     const lowStockTopQuery = `
@@ -599,7 +599,7 @@ router.get('/dashboard-summary', requireRole('administrator'), async (req, res) 
         COALESCE(item_name_english, name) AS product_name,
         quantity_in_stock::int AS qty
       FROM products
-      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      WHERE quantity_in_stock <= COALESCE(low_stock_threshold, 10) AND shop_id = $1
       ORDER BY quantity_in_stock ASC, product_id ASC
       LIMIT 6
     `;
@@ -1481,18 +1481,18 @@ router.get('/stock-low', requireRole('administrator'), async (req, res) => {
         p.product_id,
         COALESCE(p.item_name_english, p.name) as product_name,
         p.quantity_in_stock as current_qty,
-        $1::integer as minimum_qty
+        COALESCE(p.low_stock_threshold, 10) as minimum_qty
       FROM products p
-      WHERE p.quantity_in_stock <= $1
+      WHERE p.shop_id = $1 AND p.quantity_in_stock <= COALESCE(p.low_stock_threshold, 10)
       ORDER BY p.quantity_in_stock ASC, p.name ASC
-    `, [parseInt(min_quantity)]);
+    `, [req.shopId]);
     
     res.json({
       products: result.rows.map(row => ({
         product_id: row.product_id,
         product_name: row.product_name,
         current_qty: parseFloat(row.current_qty) || 0,
-        minimum_qty: parseInt(row.minimum_qty) || 5
+        minimum_qty: parseInt(row.minimum_qty, 10) || 10
       }))
     });
   } catch (error) {
@@ -1923,15 +1923,16 @@ router.get('/dashboard', async (req, res) => {
     const lowStockQuery = `
       SELECT COUNT(*)::int as low_stock_count
       FROM products
-      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      WHERE quantity_in_stock <= COALESCE(low_stock_threshold, 10) AND shop_id = $1
     `;
 
     const lowStockPeekQuery = `
       SELECT 
         COALESCE(item_name_english, name) AS product_name,
-        quantity_in_stock::int AS quantity_in_stock
+        quantity_in_stock::int AS quantity_in_stock,
+        COALESCE(low_stock_threshold, 10)::int AS minimum
       FROM products
-      WHERE quantity_in_stock <= 5 AND shop_id = $1
+      WHERE quantity_in_stock <= COALESCE(low_stock_threshold, 10) AND shop_id = $1
       ORDER BY quantity_in_stock ASC, product_id ASC
       LIMIT 1
     `;
@@ -2191,7 +2192,7 @@ router.get('/dashboard', async (req, res) => {
         ? {
             product_name: lowStockPeekRow.product_name,
             quantity_in_stock: parseInt(lowStockPeekRow.quantity_in_stock, 10) || 0,
-            minimum: 5,
+            minimum: parseInt(lowStockPeekRow.minimum, 10) || 10,
           }
         : null;
 
